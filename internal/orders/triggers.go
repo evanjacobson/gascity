@@ -219,12 +219,14 @@ const wallMinuteLayout = "2006-01-02 15:04"
 //
 // DST policy (in the resolved location):
 //   - Fall-back: the repeated hour yields two instants with the same
-//     wall-clock reading; an order fires at most once per wall-clock slot.
-//     A slot is identified by the FIRST instant carrying its wall-clock
-//     date+HH:MM, and it counts as handled once lastRun is at or after that
-//     instant — lastRun is the dispatch's stamp, not the slot it served, so
-//     a catch-up fire or a stamp that spilled into the next minute still
-//     covers the slot when its reading repeats an hour later.
+//     wall-clock reading. A fixed-time slot fires at most once per
+//     wall-clock reading: the repeated reading counts as handled when
+//     lastRun served its FIRST instant — lastRun is the dispatch's stamp,
+//     not the slot it served, so a catch-up fire or a stamp that spilled
+//     into the next minute still covers it. A schedule that matches again
+//     between the first instant and lastRun (e.g. "*/15") shows lastRun
+//     served a later slot, so it keeps firing through the repeated hour,
+//     as standard cron does.
 //   - Spring-forward: schedule minutes inside the nonexistent hour cannot
 //     match a real instant; the catch-up scan detects the gap and fires the
 //     order once at the first real minute after the jump.
@@ -253,11 +255,30 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	}
 	last = last.In(loc) // same instant, evaluator's wall clock (IsZero is instant-based, unaffected)
 
-	// slotHandled reports whether lastRun already covers t's wall-clock slot:
-	// a run at or after the slot's first instant either fired it live or
-	// caught it up, so neither branch below may fire it again.
+	// slotHandled reports whether lastRun already served t's wall-clock slot,
+	// so neither branch below may fire it again. A run at or after t's own
+	// minute served it directly. On a fall-back repeat, a run between the
+	// reading's first instant and t served it too — unless another scheduled
+	// minute lies in (first, lastRun], which means lastRun served that later
+	// slot instead. The scan spans at most the zone-offset delta.
 	slotHandled := func(t time.Time) bool {
-		return !last.IsZero() && !firstWallMinuteInstant(t).After(last)
+		if last.IsZero() {
+			return false
+		}
+		slot := t.Truncate(time.Minute)
+		if !slot.After(last) {
+			return true
+		}
+		first := firstWallMinuteInstant(t)
+		if first.Equal(slot) || first.After(last) {
+			return false
+		}
+		for m := first.Add(time.Minute); !m.After(last); m = m.Add(time.Minute) {
+			if matchesAt(m) {
+				return false
+			}
+		}
+		return true
 	}
 
 	// (a) Current minute matches — fire unless lastRun already covers this

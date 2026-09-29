@@ -1069,8 +1069,9 @@ func TestCheckTriggerCronCatchupAcrossMultiDayGapInZone(t *testing.T) {
 }
 
 // DST fall-back (US 2026-11-01: 02:00 EDT → 01:00 EST): the 01:xx hour
-// repeats. Policy: at most one fire per wall-clock slot — the repeated
-// reading is deduped against lastRun by wall-clock date+HH:MM.
+// repeats. Policy: a fixed-time slot fires at most once per wall-clock
+// reading — the repeated reading counts as handled when lastRun served its
+// first (EDT) instant, even if lastRun was stamped a minute or so later.
 func TestCheckTriggerCronDSTFallBackFiresOncePerWallClockSlot(t *testing.T) {
 	t.Run("live repeat deduped", func(t *testing.T) {
 		a, loc := etCronOrder(t, "30 1 * * *")
@@ -1154,6 +1155,95 @@ func TestCheckTriggerCronDSTFallBackFiresOncePerWallClockSlot(t *testing.T) {
 			t.Errorf("due=%v reason=%q, want already run this minute", res.Due, res.Reason)
 		}
 	})
+}
+
+// Fall-back dedupe must not silence schedules that match repeatedly inside
+// the repeated hour: like standard cron, only fixed-time slots are deduped,
+// so "*/15" and "* * * * *" keep firing through 01:xx EST.
+func TestCheckTriggerCronDSTFallBackFrequentSchedulesKeepFiring(t *testing.T) {
+	simulate := func(t *testing.T, schedule string, last time.Time) []string {
+		t.Helper()
+		a, loc := etCronOrder(t, schedule)
+		lastRunFn := func(string) (time.Time, error) { return last, nil }
+		start := time.Date(2026, 11, 1, 4, 30, 0, 0, time.UTC) // 00:30 EDT
+		end := time.Date(2026, 11, 1, 7, 30, 0, 0, time.UTC)   // 02:30 EST
+		var fires []string
+		for tick := start; tick.Before(end); tick = tick.Add(30 * time.Second) {
+			if res := checkCron(a, tick.In(loc), lastRunFn); res.Due {
+				fires = append(fires, tick.In(loc).Format(time.RFC3339))
+				last = tick.UTC()
+			}
+		}
+		return fires
+	}
+	t.Run("every 15 minutes", func(t *testing.T) {
+		fires := simulate(t, "*/15 * * * *", time.Date(2026, 11, 1, 4, 15, 0, 0, time.UTC))
+		want := []string{
+			"2026-11-01T00:30:00-04:00", "2026-11-01T00:45:00-04:00",
+			"2026-11-01T01:00:00-04:00", "2026-11-01T01:15:00-04:00",
+			"2026-11-01T01:30:00-04:00", "2026-11-01T01:45:00-04:00",
+			"2026-11-01T01:00:00-05:00", "2026-11-01T01:15:00-05:00",
+			"2026-11-01T01:30:00-05:00", "2026-11-01T01:45:00-05:00",
+			"2026-11-01T02:00:00-05:00", "2026-11-01T02:15:00-05:00",
+		}
+		if strings.Join(fires, " ") != strings.Join(want, " ") {
+			t.Errorf("fires = %v\nwant    %v", fires, want)
+		}
+	})
+	t.Run("every minute", func(t *testing.T) {
+		fires := simulate(t, "* * * * *", time.Date(2026, 11, 1, 4, 29, 0, 0, time.UTC))
+		if len(fires) != 180 {
+			t.Fatalf("got %d fires, want 180 (one per absolute minute, repeated hour included)", len(fires))
+		}
+		for _, f := range fires {
+			if !strings.Contains(f, ":00-0") {
+				t.Errorf("fire %s not at the top of its minute (duplicate within a minute)", f)
+			}
+		}
+	})
+}
+
+// Lord Howe falls back by 30 minutes (2026-04-05: 02:00 +11:00 → 01:30
+// +10:30); the repeated 01:45 must dedupe against a run on its first instant.
+func TestCheckTriggerCronDSTFallBackHalfHourZone(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatalf("load Australia/Lord_Howe: %v", err)
+	}
+	a := Order{Name: "lh-order", Trigger: "cron", Schedule: "45 1 * * *", TZ: "Australia/Lord_Howe"}
+	last := time.Date(2026, 4, 4, 14, 45, 3, 0, time.UTC)         // 01:45:03 +11:00
+	now := time.Date(2026, 4, 4, 15, 15, 20, 0, time.UTC).In(loc) // 01:45:20 +10:30
+	if _, off := now.Zone(); off != 10*3600+1800 {
+		t.Fatalf("now offset = %d, want +10:30 (fixture no longer lands in the repeated half hour)", off)
+	}
+	res := checkCron(a, now, fixedLastRun(last))
+	if res.Due {
+		t.Errorf("due=true reason=%q, want false (01:45 already fired at +11:00)", res.Reason)
+	}
+}
+
+func TestFirstWallMinuteInstant(t *testing.T) {
+	et, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load America/New_York: %v", err)
+	}
+	tests := []struct {
+		name string
+		in   time.Time
+		want time.Time
+	}{
+		{"ambiguous EST reading maps to its EDT instant", time.Date(2026, 11, 1, 6, 30, 40, 0, time.UTC).In(et), time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)},
+		{"EDT reading is already first", time.Date(2026, 11, 1, 5, 30, 40, 0, time.UTC).In(et), time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)},
+		{"unambiguous post-transition reading is itself", time.Date(2026, 11, 1, 7, 10, 15, 0, time.UTC).In(et), time.Date(2026, 11, 1, 7, 10, 0, 0, time.UTC)},
+		{"UTC truncates", time.Date(2026, 7, 7, 12, 34, 56, 0, time.UTC), time.Date(2026, 7, 7, 12, 34, 0, 0, time.UTC)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstWallMinuteInstant(tt.in); !got.Equal(tt.want) {
+				t.Errorf("firstWallMinuteInstant(%s) = %s, want %s", tt.in.Format(time.RFC3339), got.UTC().Format(time.RFC3339), tt.want.Format(time.RFC3339))
+			}
+		})
+	}
 }
 
 // DST spring-forward (US 2027-03-14: 02:00 EST → 03:00 EDT): the 02:xx hour
