@@ -973,6 +973,16 @@ func TestNativeDoltStoreReadySkipsInvalidMetadataRows(t *testing.T) {
 	if got[0].ID != "gc-ready" {
 		t.Fatalf("Ready[0].ID = %q, want gc-ready", got[0].ID)
 	}
+
+	// The corrupt row sorts first; skipping it before the limit is applied
+	// keeps a Limit=1 read from coming back empty.
+	limited, err := store.Ready(ReadyQuery{Limit: 1})
+	if err != nil {
+		t.Fatalf("Ready(Limit=1): %v", err)
+	}
+	if len(limited) != 1 || limited[0].ID != "gc-ready" {
+		t.Fatalf("Ready(Limit=1) = %#v, want only gc-ready", limited)
+	}
 }
 
 // A limit may reach the backing search ONLY together with a pushed-down sort
