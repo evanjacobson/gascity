@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	sessionhybrid "github.com/gastownhall/gascity/internal/runtime/hybrid"
 )
 
 // lifecycleOrderProvider wraps runtime.Fake and additionally implements
@@ -243,5 +246,31 @@ func writeStopLifecycleCityConfig(t *testing.T, cityDir string, cfg *config.City
 	}
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), data, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTeardownServerForStopReachesWrappedBackend pins that the auto and hybrid
+// routers forward ServerLifecycleProvider, so gc stop tears down the tmux
+// server they wrap instead of leaking it (#5175).
+func TestTeardownServerForStopReachesWrappedBackend(t *testing.T) {
+	for name, wrap := range map[string]func(runtime.Provider) runtime.Provider{
+		"auto": func(p runtime.Provider) runtime.Provider {
+			return sessionauto.New(p, runtime.NewFake())
+		},
+		"hybrid": func(p runtime.Provider) runtime.Provider {
+			return sessionhybrid.New(p, runtime.NewFake(), func(string) bool { return false })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inner := &lifecycleOrderProvider{Fake: runtime.NewFake()}
+			var stderr bytes.Buffer
+			teardownServerForStop(wrap(inner), &stderr, "gc stop")
+			if n, _, _ := teardownEvents(inner.snapshotEvents()); n != 1 {
+				t.Fatalf("wrapped backend TeardownServer calls = %d, want 1 (events %v)", n, inner.snapshotEvents())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("unexpected teardown warning: %q", stderr.String())
+			}
+		})
 	}
 }
