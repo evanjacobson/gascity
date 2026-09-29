@@ -2720,7 +2720,7 @@ func TestExecutePlannedStartsTracedCancelAfterPrepareReleasesAbandonedStarts(t *
 			inFlight := limiter.inFlight
 			limiter.mu.Unlock()
 			if inFlight != 0 {
-				t.Fatalf("async limiter inFlight = %d, want 0: abandoned prepared starts must release their slots", inFlight)
+				t.Errorf("async limiter inFlight = %d, want 0: abandoned prepared starts must release their slots", inFlight)
 			}
 			if !tracker.wait(time.Second) {
 				t.Fatal("async start tracker did not drain: abandoned prepared starts must release their tracker slots")
