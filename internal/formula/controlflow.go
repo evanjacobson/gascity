@@ -326,6 +326,14 @@ func expandLoopChildren(children []*Step, loopID string, iteration int, bodyStep
 	for i, child := range children {
 		clone := cloneStepDeep(child)
 		clone.ID = fmt.Sprintf("%s.iter%d.%s", loopID, iteration, child.ID)
+		clone.Title = substituteLoopVars(child.Title, iterVars)
+		clone.Description = substituteDescriptionPreservingPath(
+			child.Description,
+			child.DescriptionFileResolvedPath,
+			func(value string) string {
+				return substituteLoopVars(value, iterVars)
+			},
+		)
 		clone.Timeout = substituteLoopVars(child.Timeout, iterVars)
 		clone.DependsOn = rewriteLoopDependencies(child.DependsOn, loopID, iteration, bodyStepIDs)
 		clone.Needs = rewriteLoopDependencies(child.Needs, loopID, iteration, bodyStepIDs)

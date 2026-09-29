@@ -1,6 +1,7 @@
 package formula
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -266,6 +267,108 @@ func TestApplyControlFlowSubstitutesLoopVarInChildTimeout(t *testing.T) {
 	}
 	if got[0].Children[0].Timeout != "2s" {
 		t.Fatalf("child Timeout = %q, want 2s", got[0].Children[0].Timeout)
+	}
+}
+
+func TestApplyControlFlowSubstitutesLoopVarInChildTitleAndDescription(t *testing.T) {
+	steps := []*Step{
+		{
+			ID:    "moves",
+			Title: "Moves",
+			Loop: &LoopSpec{
+				Range: "1..2",
+				Var:   "move_num",
+				Body: []*Step{
+					{
+						ID:    "move",
+						Title: "Move {move_num}",
+						Children: []*Step{
+							{
+								ID:          "verify",
+								Title:       "Verify move {move_num}",
+								Description: "Check disk for move {move_num}",
+								Children: []*Step{
+									{
+										ID:          "record",
+										Title:       "Record move {move_num}",
+										Description: "Log result of move {move_num}",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := ApplyControlFlow(steps, nil)
+	if err != nil {
+		t.Fatalf("ApplyControlFlow failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	for i, parent := range got {
+		n := i + 1
+		if len(parent.Children) != 1 || len(parent.Children[0].Children) != 1 {
+			t.Fatalf("iteration %d shape = %#v, want one child with one grandchild", n, parent)
+		}
+		child := parent.Children[0]
+		if want := fmt.Sprintf("Verify move %d", n); child.Title != want {
+			t.Errorf("iteration %d child Title = %q, want %q", n, child.Title, want)
+		}
+		if want := fmt.Sprintf("Check disk for move %d", n); child.Description != want {
+			t.Errorf("iteration %d child Description = %q, want %q", n, child.Description, want)
+		}
+		grandchild := child.Children[0]
+		if want := fmt.Sprintf("Record move %d", n); grandchild.Title != want {
+			t.Errorf("iteration %d grandchild Title = %q, want %q", n, grandchild.Title, want)
+		}
+		if want := fmt.Sprintf("Log result of move %d", n); grandchild.Description != want {
+			t.Errorf("iteration %d grandchild Description = %q, want %q", n, grandchild.Description, want)
+		}
+	}
+}
+
+// TestExpandLoopChildrenPreservesOversizedDescriptionFileStubPath mirrors
+// TestExpandLoopIterationPreservesOversizedDescriptionFileStubPath for loop-body
+// children: substitution must not rewrite the already-resolved description_file
+// path (gastownhall/gascity#4860).
+func TestExpandLoopChildrenPreservesOversizedDescriptionFileStubPath(t *testing.T) {
+	step := &Step{
+		ID: "process",
+		Loop: &LoopSpec{
+			Body: []*Step{
+				{
+					ID:    "task",
+					Title: "Process item {i}",
+					Children: []*Step{
+						{
+							ID:                          "sub",
+							Title:                       "Sub item {i}",
+							Description:                 "iteration {i}: stub referencing /assets/{i}.md",
+							DescriptionFileResolvedPath: "/assets/{i}.md",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	result, err := expandLoopIteration(step, 1, map[string]string{"i": "42"})
+	if err != nil {
+		t.Fatalf("expandLoopIteration: %v", err)
+	}
+	if len(result) != 1 || len(result[0].Children) != 1 {
+		t.Fatalf("expected 1 step with 1 child, got %#v", result)
+	}
+	child := result[0].Children[0]
+	if child.Description != "iteration 42: stub referencing /assets/{i}.md" {
+		t.Errorf("child Description = %q, want non-path text substituted and only the resolved path preserved (gastownhall/gascity#4860)", child.Description)
+	}
+	if child.Title != "Sub item 42" {
+		t.Errorf("child Title = %q, want loop var substituted normally", child.Title)
 	}
 }
 
