@@ -705,10 +705,20 @@ func TestExpandPacks_RigPathSiteBoundAgentsRegistered(t *testing.T) {
 [[rigs]]
 name = "myrig"
 `},
+		// The legacy city.toml rig.path is accepted only because this fixture
+		// has no schema=2 pack.toml (which would reject it as a hard error).
 		{name: "stale legacy path overridden by site", rigBlock: `
 [[rigs]]
 name = "myrig"
 path = "/nonexistent/stale-rig"
+`},
+		{name: "site path wins over rig patch path", rigBlock: `
+[[rigs]]
+name = "myrig"
+
+[[patches.rigs]]
+name = "myrig"
+path = "/nonexistent/patched-rig"
 `},
 	}
 	for _, tc := range cases {
