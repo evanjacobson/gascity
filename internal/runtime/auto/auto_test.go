@@ -684,3 +684,71 @@ func TestSnapshotIdle_FailsClosedWhenRouteCannotSnapshot(t *testing.T) {
 		t.Error("SnapshotIdle = true on an unsupported route; must never report idle it could not observe")
 	}
 }
+
+// serverLifecycleBackend is a fake backend that owns a shared server.
+type serverLifecycleBackend struct {
+	*runtime.Fake
+	configures, teardowns int
+	err                   error
+}
+
+func (b *serverLifecycleBackend) ConfigureServer() error {
+	b.configures++
+	return b.err
+}
+
+func (b *serverLifecycleBackend) TeardownServer() error {
+	b.teardowns++
+	return b.err
+}
+
+// The auto router must not mask its backends' ServerLifecycleProvider, or
+// gc stop's teardownServerForStop type-assert fails and a city that routes
+// any agent to ACP leaks its tmux server (#5175).
+func TestProvider_ForwardsServerLifecycleToEveryBackend(t *testing.T) {
+	def := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	acp := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	var sp runtime.Provider = New(def, acp)
+	lifecycle, ok := sp.(runtime.ServerLifecycleProvider)
+	if !ok {
+		t.Fatal("auto.Provider does not implement runtime.ServerLifecycleProvider")
+	}
+	if err := lifecycle.ConfigureServer(); err != nil {
+		t.Fatalf("ConfigureServer: %v", err)
+	}
+	if err := lifecycle.TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer: %v", err)
+	}
+	for label, b := range map[string]*serverLifecycleBackend{"default": def, "acp": acp} {
+		if b.configures != 1 || b.teardowns != 1 {
+			t.Errorf("%s backend: configures=%d teardowns=%d, want 1 each", label, b.configures, b.teardowns)
+		}
+	}
+}
+
+func TestProvider_ServerLifecycleSkipsBackendsWithoutServer(t *testing.T) {
+	def := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	p := New(def, runtime.NewFake())
+	if err := p.TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer: %v", err)
+	}
+	if def.teardowns != 1 {
+		t.Fatalf("default backend teardowns = %d, want 1", def.teardowns)
+	}
+	if err := New(runtime.NewFake(), runtime.NewFake()).TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer with no server-owning backend = %v, want nil", err)
+	}
+}
+
+func TestProvider_ServerLifecycleJoinsErrorsAndAttemptsEveryBackend(t *testing.T) {
+	defErr, acpErr := errors.New("default down"), errors.New("acp down")
+	def := &serverLifecycleBackend{Fake: runtime.NewFake(), err: defErr}
+	acp := &serverLifecycleBackend{Fake: runtime.NewFake(), err: acpErr}
+	err := New(def, acp).TeardownServer()
+	if !errors.Is(err, defErr) || !errors.Is(err, acpErr) {
+		t.Fatalf("TeardownServer error = %v, want both backend errors joined", err)
+	}
+	if acp.teardowns != 1 {
+		t.Fatalf("acp backend teardowns = %d, want 1 even after default failed", acp.teardowns)
+	}
+}
