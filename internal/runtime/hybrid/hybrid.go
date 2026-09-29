@@ -28,6 +28,7 @@ var (
 	_ runtime.LivenessObserver              = (*Provider)(nil)
 	_ runtime.LivenessObserverWithError     = (*Provider)(nil)
 	_ runtime.SessionEventProvider          = (*Provider)(nil)
+	_ runtime.ServerLifecycleProvider       = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
@@ -276,4 +277,23 @@ func (p *Provider) SubscribeSessionEvents(ctx context.Context) (<-chan runtime.S
 	return runtime.SubscribeSessionEventSources(ctx,
 		runtime.SessionEventSource{Name: "local", Provider: p.local},
 		runtime.SessionEventSource{Name: "remote", Provider: p.remote})
+}
+
+// ConfigureServer forwards server-level configuration to every backend that
+// owns a shared server. Like SubscribeSessionEvents this is server-level, not
+// per-session, so it fans out instead of routing by name.
+func (p *Provider) ConfigureServer() error {
+	return runtime.ConfigureServerBackends(
+		runtime.BackendProvider{Label: "local", Provider: p.local},
+		runtime.BackendProvider{Label: "remote", Provider: p.remote})
+}
+
+// TeardownServer forwards shared-server teardown to every backend that owns
+// one. Without it, the ServerLifecycleProvider type assertion in gc stop's
+// teardownServerForStop fails on this router and the backend's server (e.g.
+// the city's tmux server, kept alive by exit-empty off) leaks (#5175).
+func (p *Provider) TeardownServer() error {
+	return runtime.TeardownServerBackends(
+		runtime.BackendProvider{Label: "local", Provider: p.local},
+		runtime.BackendProvider{Label: "remote", Provider: p.remote})
 }

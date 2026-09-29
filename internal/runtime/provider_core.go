@@ -138,3 +138,43 @@ func MergeBackendStopErrors(results ...BackendError) error {
 	}
 	return errors.Join(failures...)
 }
+
+// BackendProvider names one backend of a composite provider for fan-out
+// helpers such as [ConfigureServerBackends] and [TeardownServerBackends].
+type BackendProvider struct {
+	// Label identifies the backend in errors (e.g. "default").
+	Label string
+	// Provider is the backend.
+	Provider Provider
+}
+
+// ConfigureServerBackends calls ConfigureServer on every backend that
+// implements [ServerLifecycleProvider], for composite providers that route
+// sessions across backends. Backends without a shared server are skipped.
+// Every backend is attempted; failures are joined.
+func ConfigureServerBackends(backends ...BackendProvider) error {
+	return forEachServerLifecycle(backends, ServerLifecycleProvider.ConfigureServer)
+}
+
+// TeardownServerBackends calls TeardownServer on every backend that
+// implements [ServerLifecycleProvider], for composite providers that route
+// sessions across backends. Backends without a shared server are skipped.
+// Every backend is attempted, so one failed teardown never leaks a sibling's
+// server; failures are joined.
+func TeardownServerBackends(backends ...BackendProvider) error {
+	return forEachServerLifecycle(backends, ServerLifecycleProvider.TeardownServer)
+}
+
+func forEachServerLifecycle(backends []BackendProvider, op func(ServerLifecycleProvider) error) error {
+	var failures []error
+	for _, backend := range backends {
+		lifecycle, ok := backend.Provider.(ServerLifecycleProvider)
+		if !ok {
+			continue
+		}
+		if err := op(lifecycle); err != nil {
+			failures = append(failures, fmt.Errorf("%s backend: %w", backend.Label, err))
+		}
+	}
+	return errors.Join(failures...)
+}

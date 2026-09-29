@@ -461,3 +461,71 @@ func TestSnapshotIdle_FailsClosedWhenRouteCannotSnapshot(t *testing.T) {
 		t.Error("SnapshotIdle = true on an unsupported route; must never report idle it could not observe")
 	}
 }
+
+// serverLifecycleBackend is a fake backend that owns a shared server.
+type serverLifecycleBackend struct {
+	*runtime.Fake
+	configures, teardowns int
+	err                   error
+}
+
+func (b *serverLifecycleBackend) ConfigureServer() error {
+	b.configures++
+	return b.err
+}
+
+func (b *serverLifecycleBackend) TeardownServer() error {
+	b.teardowns++
+	return b.err
+}
+
+// The hybrid router must not mask its backends' ServerLifecycleProvider, or
+// gc stop's teardownServerForStop type-assert fails and every hybrid city
+// leaks its local tmux server (#5175).
+func TestProvider_ForwardsServerLifecycleToEveryBackend(t *testing.T) {
+	local := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	remote := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	var sp runtime.Provider = New(local, remote, isRemote)
+	lifecycle, ok := sp.(runtime.ServerLifecycleProvider)
+	if !ok {
+		t.Fatal("hybrid.Provider does not implement runtime.ServerLifecycleProvider")
+	}
+	if err := lifecycle.ConfigureServer(); err != nil {
+		t.Fatalf("ConfigureServer: %v", err)
+	}
+	if err := lifecycle.TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer: %v", err)
+	}
+	for label, b := range map[string]*serverLifecycleBackend{"local": local, "remote": remote} {
+		if b.configures != 1 || b.teardowns != 1 {
+			t.Errorf("%s backend: configures=%d teardowns=%d, want 1 each", label, b.configures, b.teardowns)
+		}
+	}
+}
+
+func TestProvider_ServerLifecycleSkipsBackendsWithoutServer(t *testing.T) {
+	local := &serverLifecycleBackend{Fake: runtime.NewFake()}
+	h := New(local, runtime.NewFake(), isRemote)
+	if err := h.TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer: %v", err)
+	}
+	if local.teardowns != 1 {
+		t.Fatalf("local backend teardowns = %d, want 1", local.teardowns)
+	}
+	if err := New(runtime.NewFake(), runtime.NewFake(), isRemote).TeardownServer(); err != nil {
+		t.Fatalf("TeardownServer with no server-owning backend = %v, want nil", err)
+	}
+}
+
+func TestProvider_ServerLifecycleJoinsErrorsAndAttemptsEveryBackend(t *testing.T) {
+	localErr, remoteErr := errors.New("local down"), errors.New("remote down")
+	local := &serverLifecycleBackend{Fake: runtime.NewFake(), err: localErr}
+	remote := &serverLifecycleBackend{Fake: runtime.NewFake(), err: remoteErr}
+	err := New(local, remote, isRemote).TeardownServer()
+	if !errors.Is(err, localErr) || !errors.Is(err, remoteErr) {
+		t.Fatalf("TeardownServer error = %v, want both backend errors joined", err)
+	}
+	if remote.teardowns != 1 {
+		t.Fatalf("remote backend teardowns = %d, want 1 even after local failed", remote.teardowns)
+	}
+}

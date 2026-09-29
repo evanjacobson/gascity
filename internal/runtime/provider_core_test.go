@@ -52,3 +52,49 @@ func TestMergeBackendListResultsPreservesNamesWhenAllBackendsAreDegraded(t *test
 		t.Fatalf("MergeBackendListResults() names = %v, want [sess-a sess-b]", names)
 	}
 }
+
+type serverLifecycleFake struct {
+	*Fake
+	calls []string
+	err   error
+}
+
+func (f *serverLifecycleFake) ConfigureServer() error {
+	f.calls = append(f.calls, "ConfigureServer")
+	return f.err
+}
+
+func (f *serverLifecycleFake) TeardownServer() error {
+	f.calls = append(f.calls, "TeardownServer")
+	return f.err
+}
+
+func TestServerBackendsFanOutSkipAndJoinErrors(t *testing.T) {
+	t.Parallel()
+
+	aErr, bErr := errors.New("a down"), errors.New("b down")
+	a := &serverLifecycleFake{Fake: NewFake(), err: aErr}
+	b := &serverLifecycleFake{Fake: NewFake(), err: bErr}
+	backends := []BackendProvider{
+		{Label: "a", Provider: a},
+		{Label: "plain", Provider: NewFake()},
+		{Label: "b", Provider: b},
+	}
+
+	err := ConfigureServerBackends(backends...)
+	if !errors.Is(err, aErr) || !errors.Is(err, bErr) {
+		t.Fatalf("ConfigureServerBackends() error = %v, want both failures joined", err)
+	}
+	err = TeardownServerBackends(backends...)
+	if !errors.Is(err, aErr) || !errors.Is(err, bErr) {
+		t.Fatalf("TeardownServerBackends() error = %v, want both failures joined", err)
+	}
+	for label, f := range map[string]*serverLifecycleFake{"a": a, "b": b} {
+		if len(f.calls) != 2 || f.calls[0] != "ConfigureServer" || f.calls[1] != "TeardownServer" {
+			t.Errorf("%s calls = %v, want [ConfigureServer TeardownServer]", label, f.calls)
+		}
+	}
+	if err := TeardownServerBackends(BackendProvider{Label: "plain", Provider: NewFake()}); err != nil {
+		t.Fatalf("TeardownServerBackends() with no server-owning backend = %v, want nil", err)
+	}
+}
