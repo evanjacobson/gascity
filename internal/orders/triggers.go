@@ -219,14 +219,14 @@ const wallMinuteLayout = "2006-01-02 15:04"
 //
 // DST policy (in the resolved location):
 //   - Fall-back: the repeated hour yields two instants with the same
-//     wall-clock reading. A fixed-time slot fires at most once per
-//     wall-clock reading: the repeated reading counts as handled when
-//     lastRun served its FIRST instant — lastRun is the dispatch's stamp,
-//     not the slot it served, so a catch-up fire or a stamp that spilled
-//     into the next minute still covers it. A schedule that matches again
-//     between the first instant and lastRun (e.g. "*/15") shows lastRun
-//     served a later slot, so it keeps firing through the repeated hour,
-//     as standard cron does.
+//     wall-clock reading. A repeated reading is skipped when lastRun
+//     already served its FIRST instant and no other scheduled minute falls
+//     between that first instant and lastRun — lastRun is the dispatch's
+//     stamp, not the slot it served, so a catch-up fire or a stamp that
+//     spilled into the next minute still counts. A slot that is the only
+//     match in the repeated hour (e.g. "30 1 * * *", "0 * * * *") therefore
+//     fires once, while schedules with other matches there ("*/15",
+//     "5,35 1 * * *") keep firing through it, as standard cron does.
 //   - Spring-forward: schedule minutes inside the nonexistent hour cannot
 //     match a real instant; the catch-up scan detects the gap and fires the
 //     order once at the first real minute after the jump.

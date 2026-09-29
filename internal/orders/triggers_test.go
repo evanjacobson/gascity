@@ -1158,8 +1158,9 @@ func TestCheckTriggerCronDSTFallBackFiresOncePerWallClockSlot(t *testing.T) {
 }
 
 // Fall-back dedupe must not silence schedules that match repeatedly inside
-// the repeated hour: like standard cron, only fixed-time slots are deduped,
-// so "*/15" and "* * * * *" keep firing through 01:xx EST.
+// the repeated hour: a repeated reading is skipped only when no other
+// scheduled minute lies between its first instant and lastRun, so "*/15" and
+// "* * * * *" keep firing through 01:xx EST, as under standard cron.
 func TestCheckTriggerCronDSTFallBackFrequentSchedulesKeepFiring(t *testing.T) {
 	simulate := func(t *testing.T, schedule string, last time.Time) []string {
 		t.Helper()
@@ -1204,14 +1205,15 @@ func TestCheckTriggerCronDSTFallBackFrequentSchedulesKeepFiring(t *testing.T) {
 }
 
 // Lord Howe falls back by 30 minutes (2026-04-05: 02:00 +11:00 → 01:30
-// +10:30); the repeated 01:45 must dedupe against a run on its first instant.
+// +10:30); the repeated 01:45 must dedupe against the run that served its
+// first instant, even though that run's stamp spilled into 01:46.
 func TestCheckTriggerCronDSTFallBackHalfHourZone(t *testing.T) {
 	loc, err := time.LoadLocation("Australia/Lord_Howe")
 	if err != nil {
 		t.Fatalf("load Australia/Lord_Howe: %v", err)
 	}
 	a := Order{Name: "lh-order", Trigger: "cron", Schedule: "45 1 * * *", TZ: "Australia/Lord_Howe"}
-	last := time.Date(2026, 4, 4, 14, 45, 3, 0, time.UTC)         // 01:45:03 +11:00
+	last := time.Date(2026, 4, 4, 14, 46, 1, 0, time.UTC)         // 01:46:01 +11:00: stamp spilled into the next minute
 	now := time.Date(2026, 4, 4, 15, 15, 20, 0, time.UTC).In(loc) // 01:45:20 +10:30
 	if _, off := now.Zone(); off != 10*3600+1800 {
 		t.Fatalf("now offset = %d, want +10:30 (fixture no longer lands in the repeated half hour)", off)
