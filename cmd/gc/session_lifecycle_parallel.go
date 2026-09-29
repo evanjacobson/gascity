@@ -1895,6 +1895,26 @@ func enqueuePreparedStartWaveForCity(
 	return results
 }
 
+// abandonPreparedStarts undoes preparation for starts that were prepared but
+// never handed to execution because the context was canceled mid-batch: it
+// clears the pre-wake in-flight lease, and for async starts it releases the
+// limiter slot and the tracker reservation that only the enqueued start
+// goroutine would otherwise release.
+func abandonPreparedStarts(prepared []preparedStart, asyncPrepared []asyncPreparedStart, sessFront *sessionpkg.Store, stderr io.Writer) {
+	for _, item := range prepared {
+		clearPendingStartInFlightLease(item.candidate.info.ID, sessFront, stderr)
+	}
+	for _, reserved := range asyncPrepared {
+		clearPendingStartInFlightLease(reserved.item.candidate.info.ID, sessFront, stderr)
+		if reserved.release != nil {
+			reserved.release()
+		}
+		if reserved.done != nil {
+			reserved.done()
+		}
+	}
+}
+
 func reserveAsyncStartSlot(ctx context.Context, limiter *asyncStartLimiter) (func(), bool, string) {
 	return limiter.reserve(ctx)
 }
@@ -3457,6 +3477,7 @@ func executePlannedStartsTraced(
 			var asyncPrepared []asyncPreparedStart
 			for _, candidate := range batchCandidates {
 				if ctx != nil && ctx.Err() != nil {
+					abandonPreparedStarts(prepared, asyncPrepared, sessFront, stderr)
 					return wakeCount
 				}
 				if !allDependenciesAliveForTemplateWithClock(candidate.logicalTemplate(cfg), cfg, desiredState, sp, cityName, store, clk) {
@@ -3554,6 +3575,7 @@ func executePlannedStartsTraced(
 			offset = end
 			var results []startResult
 			if ctx != nil && ctx.Err() != nil {
+				abandonPreparedStarts(prepared, asyncPrepared, sessFront, stderr)
 				return wakeCount
 			}
 			if startOpts.async {

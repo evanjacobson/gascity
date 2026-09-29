@@ -2597,6 +2597,139 @@ func TestExecutePlannedStartsTracedCanceledContextDoesNotStart(t *testing.T) {
 	}
 }
 
+// cancelAfterPreWakeStore cancels the tick context as soon as a pre-wake
+// commit lands, so the candidate is fully prepared (lease written, async slot
+// reserved) before executePlannedStartsTraced observes the cancellation.
+type cancelAfterPreWakeStore struct {
+	*beads.MemStore
+	cancel func()
+}
+
+func (s *cancelAfterPreWakeStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if err := s.MemStore.SetMetadataBatch(id, kvs); err != nil {
+		return err
+	}
+	if kvs["last_woke_at"] != "" {
+		s.cancel()
+	}
+	return nil
+}
+
+// Tx passes s into the callback so pre-wake writes routed through a
+// transaction still observe the cancel hook.
+func (s *cancelAfterPreWakeStore) Tx(_ string, fn func(beads.Tx) error) error {
+	return fn(s)
+}
+
+func TestExecutePlannedStartsTracedCancelAfterPrepareReleasesAbandonedStarts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		async bool
+		// sessions > 1 cancels while later candidates of the same batch are
+		// still unprepared (top-of-loop exit); 1 cancels with the whole batch
+		// prepared but not yet executed (pre-enqueue exit).
+		sessions int
+	}{
+		{name: "async_pre_enqueue_exit", async: true, sessions: 1},
+		{name: "async_mid_batch_exit", async: true, sessions: 3},
+		{name: "sync_pre_execute_exit", async: false, sessions: 1},
+		{name: "sync_mid_batch_exit", async: false, sessions: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store := &cancelAfterPreWakeStore{MemStore: beads.NewMemStore(), cancel: cancel}
+			clk := &clock.Fake{Time: time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)}
+			cfg := &config.City{}
+			desired := make(map[string]TemplateParams)
+			var candidates []startCandidate
+			var ids []string
+			for i := 0; i < tc.sessions; i++ {
+				name := fmt.Sprintf("worker-%d", i)
+				session, err := store.Create(beads.Bead{
+					ID:     "gc-" + name,
+					Title:  name,
+					Type:   sessionBeadType,
+					Labels: []string{sessionBeadLabel},
+					Metadata: map[string]string{
+						"session_name":       name,
+						"template":           name,
+						"state":              "asleep",
+						"sleep_reason":       "idle",
+						"wake_mode":          "fresh",
+						"generation":         "1",
+						"continuation_epoch": "1",
+						"instance_token":     "tok-" + name,
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				tp := TemplateParams{Command: name, SessionName: name, TemplateName: name}
+				cfg.Agents = append(cfg.Agents, config.Agent{Name: name})
+				desired[name] = tp
+				candidates = append(candidates, startCandidate{info: sessiontest.SeedBead(t, session), tp: tp})
+				ids = append(ids, session.ID)
+			}
+			sp := runtime.NewFake()
+			tracker := &asyncStartTracker{}
+			limiter := newAsyncStartLimiter(tc.sessions)
+			var options []startExecutionOption
+			if tc.async {
+				options = append(options,
+					withAsyncStartExecution(),
+					withAsyncStartTracker(tracker),
+					withAsyncStartLimiter(limiter),
+				)
+			}
+
+			woken := executePlannedStartsTraced(
+				ctx,
+				candidates,
+				cfg,
+				desired,
+				sp,
+				store,
+				"test-city",
+				"",
+				clk,
+				events.Discard,
+				5*time.Second,
+				ioDiscard{},
+				ioDiscard{},
+				nil,
+				options...,
+			)
+			if woken != 0 {
+				t.Fatalf("woken = %d, want 0 after cancellation", woken)
+			}
+			for _, call := range sp.Calls {
+				if call.Method == "Start" {
+					t.Fatalf("unexpected Start after cancellation: calls=%+v", sp.Calls)
+				}
+			}
+			for _, id := range ids {
+				updated, err := store.Get(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := updated.Metadata["last_woke_at"]; got != "" {
+					t.Fatalf("%s last_woke_at = %q, want cleared for an abandoned prepared start", id, got)
+				}
+			}
+			limiter.mu.Lock()
+			inFlight := limiter.inFlight
+			limiter.mu.Unlock()
+			if inFlight != 0 {
+				t.Fatalf("async limiter inFlight = %d, want 0: abandoned prepared starts must release their slots", inFlight)
+			}
+			if !tracker.wait(time.Second) {
+				t.Fatal("async start tracker did not drain: abandoned prepared starts must release their tracker slots")
+			}
+		})
+	}
+}
+
 func TestReconcileSessionBeadsTracedCanceledContextDoesNotTouchProvider(t *testing.T) {
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 5, 5, 12, 1, 0, 0, time.UTC)}
