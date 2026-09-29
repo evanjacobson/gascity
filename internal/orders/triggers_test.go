@@ -1107,6 +1107,53 @@ func TestCheckTriggerCronDSTFallBackFiresOncePerWallClockSlot(t *testing.T) {
 			t.Errorf("fires = %v, want exactly one at the first (EDT) 01:30", fires)
 		}
 	})
+	// lastRun is the dispatch's CreatedAt, not the slot it served, so its
+	// wall minute can differ from the slot's. Dedupe must still recognize
+	// the repeated reading as the slot the earlier run already covered.
+	t.Run("catch-up fire then repeat deduped across the transition night", func(t *testing.T) {
+		a, loc := etCronOrder(t, "30 1 * * *")
+		last := time.Date(2026, 10, 31, 5, 30, 0, 0, time.UTC) // yesterday's 01:30 EDT
+		lastRunFn := func(string) (time.Time, error) { return last, nil }
+		start := time.Date(2026, 11, 1, 0, 1, 0, 0, loc) // 2-min ticks land on odd minutes only
+		var fires []string
+		for tick := start; tick.Before(start.Add(5 * time.Hour)); tick = tick.Add(2 * time.Minute) {
+			if res := checkCron(a, tick, lastRunFn); res.Due {
+				fires = append(fires, tick.Format(time.RFC3339)+" ("+res.Reason+")")
+				last = tick.UTC()
+			}
+		}
+		if len(fires) != 1 || !strings.HasPrefix(fires[0], "2026-11-01T01:31:00-04:00") {
+			t.Errorf("fires = %v, want exactly one catch-up at 01:31 EDT", fires)
+		}
+	})
+	t.Run("run stamped into the next minute deduped on repeat", func(t *testing.T) {
+		a, loc := etCronOrder(t, "30 1 * * *")
+		// Tick at 01:30:58 EDT; the tracking bead was stamped 01:31:01 EDT.
+		last := time.Date(2026, 11, 1, 5, 31, 1, 0, time.UTC)
+		now := time.Date(2026, 11, 1, 6, 30, 20, 0, time.UTC).In(loc) // second 01:30 (EST)
+		res := checkCron(a, now, fixedLastRun(last))
+		if res.Due {
+			t.Errorf("due=true reason=%q, want false (01:30 already covered by the 01:31:01 EDT run)", res.Reason)
+		}
+	})
+	t.Run("next day still fires", func(t *testing.T) {
+		a, loc := etCronOrder(t, "30 1 * * *")
+		last := time.Date(2026, 11, 1, 5, 31, 1, 0, time.UTC) // 01:31:01 EDT
+		now := time.Date(2026, 11, 2, 1, 30, 5, 0, loc)       // Nov 2 01:30 EST
+		res := checkCron(a, now, fixedLastRun(last))
+		if !res.Due || res.Reason != "cron: schedule matched" {
+			t.Errorf("due=%v reason=%q, want next-day live fire", res.Due, res.Reason)
+		}
+	})
+	t.Run("same-minute re-evaluation not due", func(t *testing.T) {
+		a, loc := etCronOrder(t, "30 1 * * *")
+		last := time.Date(2026, 11, 2, 1, 30, 5, 0, loc)
+		now := time.Date(2026, 11, 2, 1, 30, 40, 0, loc)
+		res := checkCron(a, now, fixedLastRun(last))
+		if res.Due || res.Reason != "cron: already run this minute" {
+			t.Errorf("due=%v reason=%q, want already run this minute", res.Due, res.Reason)
+		}
+	})
 }
 
 // DST spring-forward (US 2027-03-14: 02:00 EST → 03:00 EDT): the 02:xx hour

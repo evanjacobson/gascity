@@ -219,8 +219,12 @@ const wallMinuteLayout = "2006-01-02 15:04"
 //
 // DST policy (in the resolved location):
 //   - Fall-back: the repeated hour yields two instants with the same
-//     wall-clock reading; an order fires at most once per wall-clock slot
-//     (dedupe by wall-clock date+HH:MM against lastRun).
+//     wall-clock reading; an order fires at most once per wall-clock slot.
+//     A slot is identified by the FIRST instant carrying its wall-clock
+//     date+HH:MM, and it counts as handled once lastRun is at or after that
+//     instant — lastRun is the dispatch's stamp, not the slot it served, so
+//     a catch-up fire or a stamp that spilled into the next minute still
+//     covers the slot when its reading repeats an hour later.
 //   - Spring-forward: schedule minutes inside the nonexistent hour cannot
 //     match a real instant; the catch-up scan detects the gap and fires the
 //     order once at the first real minute after the jump.
@@ -242,9 +246,6 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		matched, err := CronScheduleMatchesAt(fields, t)
 		return err == nil && matched
 	}
-	sameWallMinute := func(x, y time.Time) bool {
-		return x.Format(wallMinuteLayout) == y.Format(wallMinuteLayout)
-	}
 
 	last, err := lastRunFn(a.ScopedName())
 	if err != nil {
@@ -252,11 +253,18 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	}
 	last = last.In(loc) // same instant, evaluator's wall clock (IsZero is instant-based, unaffected)
 
-	// (a) Current minute matches — fire unless already run this wall-clock
-	// slot (wall-minute equality also covers the DST fall-back repeat, where
-	// two instants an hour apart share one wall-clock reading).
+	// slotHandled reports whether lastRun already covers t's wall-clock slot:
+	// a run at or after the slot's first instant either fired it live or
+	// caught it up, so neither branch below may fire it again.
+	slotHandled := func(t time.Time) bool {
+		return !last.IsZero() && !firstWallMinuteInstant(t).After(last)
+	}
+
+	// (a) Current minute matches — fire unless lastRun already covers this
+	// wall-clock slot (including the DST fall-back repeat, where two instants
+	// an hour apart share one wall-clock reading).
 	if matchesAt(now) {
-		if !last.IsZero() && sameWallMinute(last, now) {
+		if slotHandled(now) {
 			return TriggerResult{Due: false, Reason: "cron: already run this minute", LastRun: last}
 		}
 		return TriggerResult{Due: true, Reason: "cron: schedule matched", LastRun: last}
@@ -299,13 +307,37 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		if tOff > prevOff && matchesInWallGap(matchesAt, prev, t) {
 			return TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
 		}
-		if matchesAt(t) && !sameWallMinute(last, t) {
+		if matchesAt(t) && !slotHandled(t) {
 			return TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
 		}
 		prev = t
 	}
 
 	return TriggerResult{Due: false, Reason: "cron: schedule not matched", LastRun: last}
+}
+
+// fallBackProbeWindow bounds how far back firstWallMinuteInstant looks for a
+// larger zone offset. Real fall-back transitions shift by at most two hours.
+const fallBackProbeWindow = 3 * time.Hour
+
+// firstWallMinuteInstant returns the earliest instant whose wall-clock
+// date+HH:MM (in t's location) equals t's. Outside a DST fall-back that is t
+// truncated to the minute; inside the repeated hour it is the same reading
+// under the earlier, larger offset. It is derived from zone offsets rather
+// than time.Date, which leaves the zone choice for an ambiguous wall time
+// unspecified.
+func firstWallMinuteInstant(t time.Time) time.Time {
+	first := t.Truncate(time.Minute)
+	_, off := first.Zone()
+	_, earlierOff := first.Add(-fallBackProbeWindow).Zone()
+	if earlierOff <= off {
+		return first
+	}
+	cand := first.Add(-time.Duration(earlierOff-off) * time.Second)
+	if cand.Format(wallMinuteLayout) == first.Format(wallMinuteLayout) {
+		return cand
+	}
+	return first
 }
 
 // matchesInWallGap reports whether any wall-clock minute strictly between
