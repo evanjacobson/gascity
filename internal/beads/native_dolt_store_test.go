@@ -938,6 +938,43 @@ func TestNativeDoltStoreListSkipsInvalidMetadataRows(t *testing.T) {
 	}
 }
 
+func TestNativeDoltStoreReadySkipsInvalidMetadataRows(t *testing.T) {
+	storage := &nativeDoltStorageSpy{
+		getReadyWork: func(context.Context, beadslib.WorkFilter) ([]*beadslib.Issue, error) {
+			return []*beadslib.Issue{
+				{
+					ID:        "gc-corrupt",
+					Title:     "corrupt metadata",
+					Status:    beadslib.StatusOpen,
+					IssueType: beadslib.TypeTask,
+					Priority:  2,
+					Metadata:  json.RawMessage(`metadata is not json`),
+				},
+				{
+					ID:        "gc-ready",
+					Title:     "valid task",
+					Status:    beadslib.StatusOpen,
+					IssueType: beadslib.TypeTask,
+					Priority:  2,
+					Metadata:  json.RawMessage(`{"gc.step_ref":"ready"}`),
+				},
+			}, nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	got, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready len = %d, want only valid rows: %#v", len(got), got)
+	}
+	if got[0].ID != "gc-ready" {
+		t.Fatalf("Ready[0].ID = %q, want gc-ready", got[0].ID)
+	}
+}
+
 // A limit may reach the backing search ONLY together with a pushed-down sort
 // (IssueFilter.SortBy) — a bare limit on an unsorted query truncates an
 // arbitrary subset. Created-order sorts push down (sr-dp9o: keeping the limit
