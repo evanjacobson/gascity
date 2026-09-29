@@ -402,6 +402,99 @@ func TestEventStreamNoEvents(t *testing.T) {
 	}
 }
 
+// TestEventStreamRejectsMalformedResumeCursor pins that a non-empty resume
+// cursor that is not a seq is a typed 400 before any SSE bytes. Falling
+// through to Watch(0) replayed the city's entire retained history.
+func TestEventStreamRejectsMalformedResumeCursor(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		query       string
+		lastEventID string
+	}{
+		{name: "after_seq garbage", query: "?after_seq=abc"},
+		{name: "after_seq composite supervisor cursor", query: "?after_seq=mycity:2"},
+		{name: "Last-Event-ID garbage", lastEventID: "garbage"},
+		{name: "Last-Event-ID garbage wins over valid after_seq", query: "?after_seq=1", lastEventID: "garbage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newFakeState(t)
+			ep := state.eventProv.(*events.Fake)
+			ep.Record(events.Event{Type: events.SessionWoke, Actor: "gc", Subject: "historic"})
+			h := newTestCityHandler(t, state)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			req := httptest.NewRequest("GET", cityURL(state, "/events/stream")+tc.query, nil).WithContext(ctx)
+			if tc.lastEventID != "" {
+				req.Header.Set("Last-Event-ID", tc.lastEventID)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "invalid-cursor") {
+				t.Fatalf("body lacks the invalid-cursor code: %s", rec.Body.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); ct == "text/event-stream" {
+				t.Fatalf("Content-Type = %q, want a problem response, not a stream", ct)
+			}
+			if strings.Contains(rec.Body.String(), "historic") {
+				t.Fatalf("malformed cursor replayed history: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestEventStreamResumeCursorPositions pins the accepted cursor forms: a
+// numeric cursor resumes strictly after that seq, and an absent or
+// whitespace-only cursor starts at the current head.
+func TestEventStreamResumeCursorPositions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		query       string
+		lastEventID string
+		wantFirst   bool
+		wantSecond  bool
+	}{
+		{name: "no cursor starts at head"},
+		{name: "whitespace after_seq starts at head", query: "?after_seq=%20%20"},
+		{name: "after_seq resumes after seq", query: "?after_seq=1", wantSecond: true},
+		{name: "Last-Event-ID resumes after seq", lastEventID: "1", wantSecond: true},
+		{name: "Last-Event-ID wins over after_seq", query: "?after_seq=2", lastEventID: "1", wantSecond: true},
+		{name: "after_seq zero replays from start", query: "?after_seq=0", wantFirst: true, wantSecond: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := newFakeState(t)
+			ep := state.eventProv.(*events.Fake)
+			ep.Record(events.Event{Type: events.SessionWoke, Actor: "gc", Subject: "historic-first"})
+			ep.Record(events.Event{Type: events.SessionWoke, Actor: "gc", Subject: "historic-second"})
+			h := newTestCityHandler(t, state)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			req := httptest.NewRequest("GET", cityURL(state, "/events/stream")+tc.query, nil).WithContext(ctx)
+			if tc.lastEventID != "" {
+				req.Header.Set("Last-Event-ID", tc.lastEventID)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if got := strings.Contains(body, "historic-first"); got != tc.wantFirst {
+				t.Errorf("delivered seq 1 = %v, want %v; body = %s", got, tc.wantFirst, body)
+			}
+			if got := strings.Contains(body, "historic-second"); got != tc.wantSecond {
+				t.Errorf("delivered seq 2 = %v, want %v; body = %s", got, tc.wantSecond, body)
+			}
+		})
+	}
+}
+
 func TestHandleEventEmit(t *testing.T) {
 	state := newFakeState(t)
 	h := newTestCityHandler(t, state)

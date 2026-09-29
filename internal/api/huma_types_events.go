@@ -5,7 +5,9 @@ package api
 // of huma_handlers_events.go.
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -105,17 +107,21 @@ type SessionPendingClearedEvent struct {
 	RequestID string `json:"request_id" doc:"Request ID of the interaction that was cleared."`
 }
 
-// resolveAfterSeq returns the reconnect position from Last-Event-ID or after_seq.
-func (e *EventStreamInput) resolveAfterSeq() uint64 {
-	if e.LastEventID != "" {
-		if n, err := strconv.ParseUint(e.LastEventID, 10, 64); err == nil {
-			return n
+// resolveAfterSeq returns the reconnect position from Last-Event-ID or
+// after_seq, preferring Last-Event-ID. Whitespace-only values count as absent.
+// A present value that is not a seq is an error rather than 0, which Watch
+// treats as "replay the entire retained history".
+func (e *EventStreamInput) resolveAfterSeq() (uint64, error) {
+	for _, cursor := range []string{e.LastEventID, e.AfterSeq} {
+		cursor = strings.TrimSpace(cursor)
+		if cursor == "" {
+			continue
 		}
-	}
-	if e.AfterSeq != "" {
-		if n, err := strconv.ParseUint(e.AfterSeq, 10, 64); err == nil {
-			return n
+		n, err := strconv.ParseUint(cursor, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("event stream resume cursor %q is not a sequence number", cursor)
 		}
+		return n, nil
 	}
-	return 0
+	return 0, nil
 }
