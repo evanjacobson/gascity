@@ -2647,7 +2647,6 @@ func TestExecutePlannedStartsTracedCancelAfterPrepareReleasesAbandonedStarts(t *
 			for i := 0; i < tc.sessions; i++ {
 				name := fmt.Sprintf("worker-%d", i)
 				session, err := store.Create(beads.Bead{
-					ID:     "gc-" + name,
 					Title:  name,
 					Type:   sessionBeadType,
 					Labels: []string{sessionBeadLabel},
@@ -2714,7 +2713,7 @@ func TestExecutePlannedStartsTracedCancelAfterPrepareReleasesAbandonedStarts(t *
 					t.Fatal(err)
 				}
 				if got := updated.Metadata["last_woke_at"]; got != "" {
-					t.Fatalf("%s last_woke_at = %q, want cleared for an abandoned prepared start", id, got)
+					t.Errorf("%s last_woke_at = %q, want cleared for an abandoned prepared start", id, got)
 				}
 			}
 			limiter.mu.Lock()
