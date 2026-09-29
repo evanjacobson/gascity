@@ -415,6 +415,8 @@ func TestEventStreamRejectsMalformedResumeCursor(t *testing.T) {
 		{name: "after_seq composite supervisor cursor", query: "?after_seq=mycity:2"},
 		{name: "Last-Event-ID garbage", lastEventID: "garbage"},
 		{name: "Last-Event-ID garbage wins over valid after_seq", query: "?after_seq=1", lastEventID: "garbage"},
+		{name: "after_seq negative", query: "?after_seq=-1"},
+		{name: "after_seq overflows uint64", query: "?after_seq=18446744073709551616"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := newFakeState(t)
@@ -461,6 +463,7 @@ func TestEventStreamResumeCursorPositions(t *testing.T) {
 		{name: "no cursor starts at head"},
 		{name: "whitespace after_seq starts at head", query: "?after_seq=%20%20"},
 		{name: "after_seq resumes after seq", query: "?after_seq=1", wantSecond: true},
+		{name: "after_seq with leading space resumes after seq", query: "?after_seq=%201", wantSecond: true},
 		{name: "Last-Event-ID resumes after seq", lastEventID: "1", wantSecond: true},
 		{name: "Last-Event-ID wins over after_seq", query: "?after_seq=2", lastEventID: "1", wantSecond: true},
 		{name: "after_seq zero replays from start", query: "?after_seq=0", wantFirst: true, wantSecond: true},

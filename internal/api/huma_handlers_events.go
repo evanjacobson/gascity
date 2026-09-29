@@ -320,8 +320,9 @@ func eventRotateResponseFromResult(result events.RotationResult, compressionStat
 	}
 }
 
-// checkEventStream is the precheck for GET /v0/events/stream. It runs before
-// the response is committed so it can return proper HTTP errors.
+// checkEventStream is the precheck for GET
+// /v0/city/{cityName}/events/stream. It runs before the response is committed
+// so it can return proper HTTP errors.
 func (s *Server) checkEventStream(_ context.Context, input *EventStreamInput) error {
 	if s.state.EventProvider() == nil {
 		return apierr.ServiceUnavailable.Msg("events not enabled")
@@ -332,8 +333,9 @@ func (s *Server) checkEventStream(_ context.Context, input *EventStreamInput) er
 	return nil
 }
 
-// streamEvents is the SSE streaming callback for GET /v0/events/stream. The
-// precheck has already verified the event provider exists. This function
+// streamEvents is the SSE streaming callback for GET
+// /v0/city/{cityName}/events/stream. The precheck has already verified the
+// event provider exists and the resume cursor parses. This function
 // creates a watcher and streams events until the context is canceled.
 // Heartbeat events are sent every 15s to keep the connection alive.
 func (s *Server) streamEvents(hctx huma.Context, input *EventStreamInput, send sse.Sender) {
