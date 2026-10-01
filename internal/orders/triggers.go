@@ -219,8 +219,14 @@ const wallMinuteLayout = "2006-01-02 15:04"
 //
 // DST policy (in the resolved location):
 //   - Fall-back: the repeated hour yields two instants with the same
-//     wall-clock reading; an order fires at most once per wall-clock slot
-//     (dedupe by wall-clock date+HH:MM against lastRun).
+//     wall-clock reading. A repeated reading is skipped when lastRun
+//     already served its FIRST instant and no other scheduled minute falls
+//     between that first instant and lastRun — lastRun is the dispatch's
+//     stamp, not the slot it served, so a catch-up fire or a stamp that
+//     spilled into the next minute still counts. A slot that is the only
+//     match in the repeated hour (e.g. "30 1 * * *", "0 * * * *") therefore
+//     fires once, while schedules with other matches there ("*/15",
+//     "5,35 1 * * *") keep firing through it, as standard cron does.
 //   - Spring-forward: schedule minutes inside the nonexistent hour cannot
 //     match a real instant; the catch-up scan detects the gap and fires the
 //     order once at the first real minute after the jump.
@@ -242,9 +248,6 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		matched, err := CronScheduleMatchesAt(fields, t)
 		return err == nil && matched
 	}
-	sameWallMinute := func(x, y time.Time) bool {
-		return x.Format(wallMinuteLayout) == y.Format(wallMinuteLayout)
-	}
 
 	last, err := lastRunFn(a.ScopedName())
 	if err != nil {
@@ -252,11 +255,37 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 	}
 	last = last.In(loc) // same instant, evaluator's wall clock (IsZero is instant-based, unaffected)
 
-	// (a) Current minute matches — fire unless already run this wall-clock
-	// slot (wall-minute equality also covers the DST fall-back repeat, where
-	// two instants an hour apart share one wall-clock reading).
+	// slotHandled reports whether lastRun already served t's wall-clock slot,
+	// so neither branch below may fire it again. A run at or after t's own
+	// minute served it directly. On a fall-back repeat, a run between the
+	// reading's first instant and t served it too — unless another scheduled
+	// minute lies in (first, lastRun], which means lastRun served that later
+	// slot instead. The scan spans at most the zone-offset delta.
+	slotHandled := func(t time.Time) bool {
+		if last.IsZero() {
+			return false
+		}
+		slot := t.Truncate(time.Minute)
+		if !slot.After(last) {
+			return true
+		}
+		first := firstWallMinuteInstant(t)
+		if first.Equal(slot) || first.After(last) {
+			return false
+		}
+		for m := first.Add(time.Minute); !m.After(last); m = m.Add(time.Minute) {
+			if matchesAt(m) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// (a) Current minute matches — fire unless lastRun already covers this
+	// wall-clock slot (including the DST fall-back repeat, where two instants
+	// an hour apart share one wall-clock reading).
 	if matchesAt(now) {
-		if !last.IsZero() && sameWallMinute(last, now) {
+		if slotHandled(now) {
 			return TriggerResult{Due: false, Reason: "cron: already run this minute", LastRun: last}
 		}
 		return TriggerResult{Due: true, Reason: "cron: schedule matched", LastRun: last}
@@ -299,13 +328,37 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		if tOff > prevOff && matchesInWallGap(matchesAt, prev, t) {
 			return TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
 		}
-		if matchesAt(t) && !sameWallMinute(last, t) {
+		if matchesAt(t) && !slotHandled(t) {
 			return TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
 		}
 		prev = t
 	}
 
 	return TriggerResult{Due: false, Reason: "cron: schedule not matched", LastRun: last}
+}
+
+// fallBackProbeWindow bounds how far back firstWallMinuteInstant looks for a
+// larger zone offset. Real fall-back transitions shift by at most two hours.
+const fallBackProbeWindow = 3 * time.Hour
+
+// firstWallMinuteInstant returns the earliest instant whose wall-clock
+// date+HH:MM (in t's location) equals t's. Outside a DST fall-back that is t
+// truncated to the minute; inside the repeated hour it is the same reading
+// under the earlier, larger offset. It is derived from zone offsets rather
+// than time.Date, which leaves the zone choice for an ambiguous wall time
+// unspecified.
+func firstWallMinuteInstant(t time.Time) time.Time {
+	first := t.Truncate(time.Minute)
+	_, off := first.Zone()
+	_, earlierOff := first.Add(-fallBackProbeWindow).Zone()
+	if earlierOff <= off {
+		return first
+	}
+	cand := first.Add(-time.Duration(earlierOff-off) * time.Second)
+	if cand.Format(wallMinuteLayout) == first.Format(wallMinuteLayout) {
+		return cand
+	}
+	return first
 }
 
 // matchesInWallGap reports whether any wall-clock minute strictly between
