@@ -577,6 +577,13 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	// Expand rig packs so the merged agent list (city- and rig-scope) is
 	// complete before city-level patches are applied. Per-rig patches are
 	// deferred so they still run after city-level [[patches.agent]].
+	//
+	// Overlay .gc/site.toml rig paths first so path-only rigs get rig-root
+	// pack.toml discovery. Warnings are discarded here; the ApplySiteBindings
+	// call below re-applies the bindings after patches and reports them.
+	if _, err := ApplySiteBindings(fs, cityRoot, root); err != nil {
+		return nil, nil, err
+	}
 	rigFormulaDirs := make(map[string][]string)
 	var deferredRigPatches []deferredRigPatches
 	if HasPackRigs(root.Rigs) {

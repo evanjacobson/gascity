@@ -692,3 +692,105 @@ path = "`+rigDir+`"
 	}
 	t.Fatalf("myrig/worker not found in cfg.Agents; got %v", names)
 }
+
+// TestExpandPacks_RigPathSiteBoundAgentsRegistered asserts that rig-root
+// pack.toml discovery uses the rig path bound in .gc/site.toml, not only a
+// legacy city.toml path, and that site-binding warnings are reported once.
+func TestExpandPacks_RigPathSiteBoundAgentsRegistered(t *testing.T) {
+	cases := []struct {
+		name     string
+		rigBlock string
+	}{
+		{name: "site-only path", rigBlock: `
+[[rigs]]
+name = "myrig"
+`},
+		// The legacy city.toml rig.path is accepted only because this fixture
+		// has no city-root pack.toml with schema >= 2 (which would reject it as a
+		// hard error).
+		{name: "stale legacy path overridden by site", rigBlock: `
+[[rigs]]
+name = "myrig"
+path = "/nonexistent/stale-rig"
+`},
+		{name: "site path wins over rig patch path", rigBlock: `
+[[rigs]]
+name = "myrig"
+
+[[patches.rigs]]
+name = "myrig"
+path = "/nonexistent/patched-rig"
+`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rigDir := filepath.Join(dir, "rigroot")
+
+			writeTestFile(t, rigDir, "pack.toml", `
+[pack]
+name = "mrig-pack"
+schema = 1
+
+[[agent]]
+name = "worker"
+scope = "rig"
+`)
+
+			cityDir := filepath.Join(dir, "city")
+			writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+`+tc.rigBlock+`
+[[rigs]]
+name = "unbound"
+`)
+			writeTestFile(t, filepath.Join(cityDir, ".gc"), "site.toml", `
+[[rig]]
+name = "myrig"
+path = "`+rigDir+`"
+`)
+
+			cfg, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+			if err != nil {
+				t.Fatalf("LoadWithIncludes: %v", err)
+			}
+
+			if cfg.Rigs[0].Path != rigDir {
+				t.Errorf("myrig path = %q, want %q", cfg.Rigs[0].Path, rigDir)
+			}
+
+			found := false
+			explicit := explicitAgents(cfg.Agents)
+			for _, a := range explicit {
+				if a.Name == "worker" && a.Dir == "myrig" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				names := make([]string, 0, len(explicit))
+				for _, a := range explicit {
+					names = append(names, a.Dir+"/"+a.Name)
+				}
+				t.Errorf("myrig/worker not found in cfg.Agents; got %v", names)
+			}
+
+			missing := missingRigSiteBindingWarning("unbound")
+			count := 0
+			seen := make(map[string]bool, len(prov.Warnings))
+			for _, w := range prov.Warnings {
+				if w == missing {
+					count++
+				}
+				if seen[w] {
+					t.Errorf("duplicate warning %q", w)
+				}
+				seen[w] = true
+			}
+			if count != 1 {
+				t.Errorf("missing site binding warning count = %d, want 1; warnings = %v", count, prov.Warnings)
+			}
+		})
+	}
+}
