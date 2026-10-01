@@ -1847,6 +1847,9 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 			}
 			bead, err := beadFromNativeIssue(issue)
 			if err != nil {
+				if isNativeIssueMetadataParseError(err) {
+					continue
+				}
 				return err
 			}
 			if !IsReadyCandidateForTier(bead, now, q.TierMode) || seen[bead.ID] {
