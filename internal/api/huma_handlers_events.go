@@ -320,23 +320,33 @@ func eventRotateResponseFromResult(result events.RotationResult, compressionStat
 	}
 }
 
-// checkEventStream is the precheck for GET /v0/events/stream. It runs before
-// the response is committed so it can return proper HTTP errors.
-func (s *Server) checkEventStream(_ context.Context, _ *EventStreamInput) error {
+// checkEventStream is the precheck for GET
+// /v0/city/{cityName}/events/stream. It runs before the response is committed
+// so it can return proper HTTP errors.
+func (s *Server) checkEventStream(_ context.Context, input *EventStreamInput) error {
 	if s.state.EventProvider() == nil {
 		return apierr.ServiceUnavailable.Msg("events not enabled")
+	}
+	if _, err := input.resolveAfterSeq(); err != nil {
+		return apierr.InvalidCursor.Msg(err.Error() + "; omit after_seq and Last-Event-ID to start at the current event head")
 	}
 	return nil
 }
 
-// streamEvents is the SSE streaming callback for GET /v0/events/stream. The
-// precheck has already verified the event provider exists. This function
+// streamEvents is the SSE streaming callback for GET
+// /v0/city/{cityName}/events/stream. The precheck has already verified the
+// event provider exists and the resume cursor parses. This function
 // creates a watcher and streams events until the context is canceled.
 // Heartbeat events are sent every 15s to keep the connection alive.
 func (s *Server) streamEvents(hctx huma.Context, input *EventStreamInput, send sse.Sender) {
 	ctx := hctx.Context()
 	ep := s.state.EventProvider()
-	afterSeq := input.resolveAfterSeq()
+	afterSeq, err := input.resolveAfterSeq()
+	if err != nil {
+		// checkEventStream rejects malformed cursors before headers commit.
+		log.Printf("api: events-stream: refusing malformed resume cursor: %v", err)
+		return
+	}
 	if strings.TrimSpace(input.LastEventID) == "" && strings.TrimSpace(input.AfterSeq) == "" {
 		// Head-start (no resume cursor): stream from now. Fail closed on a
 		// LatestSeq error rather than fall through to afterSeq=0, which Watch now
