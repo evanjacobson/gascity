@@ -1020,6 +1020,12 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 			printMissingBeadError(stderr, missingBeadErr, missingBeadForceApplies(opts))
 			return 1
 		}
+		// A batch dry-run that refuses children still renders its preview, so
+		// the refused children are shown beside the ones that would route; the
+		// exit code stays the real run's.
+		if result.DryRun && !jsonOutput {
+			previewSlingDryRun(opts, deps, querier, result, humanStdout, stderr)
+		}
 		// In batch mode, per-child FailReasons have already been rendered
 		// by printBatchSlingResult above. The error returned from
 		// DoSlingBatch is an errors.Join of a "N/M children failed"
@@ -1037,27 +1043,7 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 		if jsonOutput {
 			return writeSlingJSONResult(result, "", jsonStdout, stderr)
 		}
-		// For batch dry-run, look up the container bead for display.
-		// DoSling sets ContainerType on the result only when it actually
-		// went down the batch path (i.e. the bead is a container type
-		// like convoy). For leaf tasks it returns the single-bead result
-		// with ContainerType unset — so the dry-run preview must use
-		// dryRunSingle, otherwise it renders the misleading "container
-		// with zero children" output even though the real run would
-		// route the bead itself.
-		if result.ContainerType != "" && querier != nil {
-			if b, getErr := querier.Get(opts.BeadOrFormula); getErr == nil {
-				children, _ := dryRunBatchChildren(querier, b.ID)
-				var open []beads.Bead
-				for _, c := range children {
-					if c.Status == "open" {
-						open = append(open, c)
-					}
-				}
-				return dryRunBatch(opts, deps, humanStdout, stderr, b, children, open, querier)
-			}
-		}
-		return dryRunSingle(opts, deps, querier, humanStdout, stderr)
+		return previewSlingDryRun(opts, deps, querier, result, humanStdout, stderr)
 	}
 	if result.NudgeAgent != nil {
 		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, humanStdout, stderr)
@@ -1079,6 +1065,33 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 		fmt.Fprintf(humanStdout, "Dashboard: %s%s\n", dashboardURL, suffix) //nolint:errcheck // best-effort stdout
 	}
 	return 0
+}
+
+// previewSlingDryRun renders the dry-run preview for a sling that went through
+// the batch dispatcher: the container preview when the bead expanded as a
+// container, otherwise the single-bead preview.
+func previewSlingDryRun(opts slingOpts, deps slingDeps, querier BeadChildQuerier, result sling.SlingResult, stdout, stderr io.Writer) int {
+	// For batch dry-run, look up the container bead for display.
+	// DoSling sets ContainerType on the result only when it actually
+	// went down the batch path (i.e. the bead is a container type
+	// like convoy). For leaf tasks it returns the single-bead result
+	// with ContainerType unset — so the dry-run preview must use
+	// dryRunSingle, otherwise it renders the misleading "container
+	// with zero children" output even though the real run would
+	// route the bead itself.
+	if result.ContainerType != "" && querier != nil {
+		if b, getErr := querier.Get(opts.BeadOrFormula); getErr == nil {
+			children, _ := dryRunBatchChildren(querier, b.ID)
+			var open []beads.Bead
+			for _, c := range children {
+				if c.Status == "open" {
+					open = append(open, c)
+				}
+			}
+			return dryRunBatch(opts, deps, stdout, stderr, b, children, open, querier)
+		}
+	}
+	return dryRunSingle(opts, deps, querier, stdout, stderr)
 }
 
 func dryRunBatchChildren(querier BeadChildQuerier, containerID string) ([]beads.Bead, error) {
@@ -1953,11 +1966,18 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 	// Cross-rig section — show when container bead prefix doesn't match agent's rig.
 	printCrossRigSection(w, b.ID, a, deps.Cfg)
 
-	// Children list.
+	// Children list. An open child the real run refuses is shown as refused
+	// and left out of the attach and route sections below.
 	w(fmt.Sprintf("  Children (%d total, %d open):", len(children), len(open)))
+	var routable []beads.Bead
 	for _, c := range children {
 		clabel := sling.FormatBeadLabel(c.ID, c.Title)
 		if c.Status == "open" {
+			if sling.RefusesExpandedWorkflowRoot(opts, c) {
+				w("    " + clabel + " (open) → refused (expanded workflow root)")
+				continue
+			}
+			routable = append(routable, c)
 			check := sling.CheckBeadStateWithOptions(querier, c.ID, a, deps, sling.BeadCheckOptions{
 				NoConvoy: opts.NoConvoy,
 			})
@@ -1980,7 +2000,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 	if opts.OnFormula != "" {
 		w("Attach formula (per open child):")
 		w("  Would run:")
-		for _, c := range open {
+		for _, c := range routable {
 			w("    gc formula cook " + opts.OnFormula + " --attach " + c.ID)
 		}
 		w("")
@@ -1988,7 +2008,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 		w("Default formula (per open child):")
 		w("  Formula: " + a.EffectiveDefaultSlingFormula())
 		w("  Would run:")
-		for _, c := range open {
+		for _, c := range routable {
 			w("    gc formula cook " + a.EffectiveDefaultSlingFormula() + " --attach " + c.ID)
 		}
 		w("")
@@ -1996,7 +2016,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 
 	// Route commands.
 	w("Route commands (not executed):")
-	for _, c := range open {
+	for _, c := range routable {
 		routeCmd, _ := sling.BuildSlingCommandForAgent("sling_query", a.EffectiveSlingQuery(), c.ID, deps.CityPath, deps.CityName, a, deps.Cfg.Rigs)
 		w("  " + routeCmd)
 	}
