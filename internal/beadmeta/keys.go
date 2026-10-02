@@ -321,13 +321,15 @@ const (
 	WorktreeRepoMetadataKey        = "gc.worktree_repo"
 	WorktreeRootMetadataKey        = "gc.worktree_root"
 	WorkflowIDMetadataKey          = "gc.workflow_id"
-	// WorkflowExpandedMetadataKey marks a graph.v2 workflow root that was
-	// compiled with real child steps beyond the root itself. Its absence
-	// distinguishes a genuinely root-only (#2763-shape) molecule, whose root
-	// IS the unit of work and must remain claimable via the
-	// RunTargetMetadataKey fallback, from a fully-expanded root whose real
-	// children have all closed and is only waiting on workflow-finalize —
-	// see hookClaimMatchesRoute/hookClaimRoute (#5900).
+	// WorkflowExpandedMetadataKey marks a root that internal/molecule
+	// instantiated with real child steps beyond the root itself. On a
+	// KindWorkflow root its absence distinguishes a genuinely root-only
+	// (#2763-shape) molecule, whose root IS the unit of work, from an
+	// expanded root that is only a container for its steps (#5900).
+	//
+	// The marker is not exclusive to workflow roots: retry and ralph attempt
+	// roots carry it with gc.kind=task and are real work. Read it through
+	// IsExpandedWorkflowRoot, which also checks the kind, never on its own.
 	WorkflowExpandedMetadataKey = "gc.workflow_expanded"
 )
 

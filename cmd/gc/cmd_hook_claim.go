@@ -3134,19 +3134,19 @@ func hookRouteIdentitiesEqual(a, b string) bool {
 // exists so a genuinely root-only (#2763-shape) molecule - whose root IS the
 // unit of work, with no compiled children - is claimable via its
 // gc.run_target authoring hint. It must not also resurrect a fully-expanded
-// root: once compile.go gives a graph.v2 root real child steps, it stamps
-// gc.workflow_expanded=true, and that root's only remaining path to
-// dependency-readiness is every real child closing while workflow-finalize
-// has not yet run and closed it (#5900) - a state the fallback must not
-// treat as claimable (WorkflowTopologyKinds document workflow roots as never
-// claimable). A candidate without the stamp predates this fix or was never
-// expanded, so it keeps the original permissive behavior.
+// root (beadmeta.IsExpandedWorkflowRoot): once internal/molecule instantiates
+// a graph.v2 root with real child steps, it stamps gc.workflow_expanded=true,
+// and that root's only remaining path to dependency-readiness is every real
+// child closing while workflow-finalize has not yet run and closed it (#5900)
+// - a state the fallback must not treat as claimable. A candidate without the
+// stamp was never expanded, or was expanded before the stamp existed, and the
+// fallback applies to it.
 func workflowRunTargetFallbackEligible(candidate beads.Bead) bool {
 	kind := strings.TrimSpace(candidate.Metadata[beadmeta.KindMetadataKey])
 	if kind != beadmeta.KindWorkflow {
 		return false
 	}
-	return strings.TrimSpace(candidate.Metadata[beadmeta.WorkflowExpandedMetadataKey]) != "true"
+	return !beadmeta.IsExpandedWorkflowRoot(candidate.Metadata)
 }
 
 func hookClaimMatchesRoute(candidate beads.Bead, routeTargets []string) bool {

@@ -83,8 +83,10 @@ func IsControlDispatcherKind(kind string) bool {
 
 // IsWorkflowTopologyKind reports whether a gc.kind value identifies a
 // workflow-topology step (root workflow, scope latch, or formula spec).
-// Routing never lands on these — they exist to structure the graph, not
-// to be claimed by an agent.
+// Per-step route binding skips these — they exist to structure the graph.
+// The workflow root is routed separately: DecorateGraphWorkflowRecipe stamps
+// gc.routed_to on it, and whether that routed root is itself work is decided
+// by beadmeta.IsExpandedWorkflowRoot.
 func IsWorkflowTopologyKind(kind string) bool {
 	return slices.Contains(beadmeta.WorkflowTopologyKinds, kind)
 }
