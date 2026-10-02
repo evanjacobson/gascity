@@ -2745,6 +2745,96 @@ metadata = { "gc.run_target" = "worker" }
 	}
 }
 
+// runPoolOrder runs `gc order run` for a city-scoped pool order running
+// formulaBody against store and returns the exit code and stderr.
+func runPoolOrder(t *testing.T, store beads.Store, formulaBody string) (int, string) {
+	t.Helper()
+	cityDir := t.TempDir()
+	formulaDir := t.TempDir()
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+
+[daemon]
+formula_v2 = true
+
+[[agent]]
+name = "worker"
+max_active_sessions = 2
+
+[[agent]]
+name = "control-dispatcher"
+max_active_sessions = 1
+`)
+	writeFile(t, filepath.Join(formulaDir, "pool-order.toml"), formulaBody)
+	a := orders.Order{Name: "pool-patrol", Formula: "pool-order", Pool: "worker", Trigger: "cooldown", Interval: "15m", FormulaLayer: formulaDir}
+	var stdout, stderr bytes.Buffer
+	code := doOrderRun([]orders.Order{a}, a.Name, a.Rig, cityDir, beads.OrdersStore{Store: store}, nil, &stdout, &stderr)
+	return code, stderr.String()
+}
+
+// TestOrderRunPoolPromotesOnlyExpandedWorkflowRoot pins the manual twin of the
+// dispatcher's launch rule: an expanded workflow root is a container no worker
+// claims, so `gc order run` leaves it in_progress, while a root-only workflow
+// root is itself the claimable unit of work and stays open.
+func TestOrderRunPoolPromotesOnlyExpandedWorkflowRoot(t *testing.T) {
+	tests := []struct {
+		name         string
+		formula      string
+		wantExpanded bool
+		wantStatus   string
+	}{
+		{name: "expanded root", formula: expandedPoolOrderFormula, wantExpanded: true, wantStatus: "in_progress"},
+		{name: "root-only root", formula: rootOnlyPoolOrderFormula, wantExpanded: false, wantStatus: "open"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			if code, stderr := runPoolOrder(t, store, tt.formula); code != 0 {
+				t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr)
+			}
+
+			root := workBeadByOrderLabel(t, store, "order-run:pool-patrol")
+			if got := root.Metadata[beadmeta.KindMetadataKey]; got != beadmeta.KindWorkflow {
+				t.Fatalf("root gc.kind = %q, want %q", got, beadmeta.KindWorkflow)
+			}
+			if got := beadmeta.IsExpandedWorkflowRoot(root.Metadata); got != tt.wantExpanded {
+				t.Fatalf("IsExpandedWorkflowRoot = %v, want %v; metadata = %#v", got, tt.wantExpanded, root.Metadata)
+			}
+			if root.Status != tt.wantStatus {
+				t.Fatalf("root status = %q, want %q", root.Status, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// TestOrderRunRootPromotionFailureExitsNonZero pins that `gc order run` reports
+// a root it could not promote instead of printing a clean launch.
+func TestOrderRunRootPromotionFailureExitsNonZero(t *testing.T) {
+	code, stderr := runPoolOrder(t, statusUpdateFailStore{Store: beads.NewMemStore()}, expandedPoolOrderFormula)
+	if code != 1 {
+		t.Fatalf("doOrderRun = %d, want 1; stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "status update failed") {
+		t.Fatalf("stderr = %q, want the promotion error", stderr)
+	}
+}
+
+// TestOrderRunLegacyPoolOrderSkipsRootPromotion pins the manual twin of the
+// dispatcher's gate: a v1 order's root is never an expanded workflow root, so
+// `gc order run` must not re-read it, and a store that cannot serve that read
+// must not fail a run that launched.
+func TestOrderRunLegacyPoolOrderSkipsRootPromotion(t *testing.T) {
+	store := beads.NewMemStore()
+	if code, stderr := runPoolOrder(t, &getAfterOrderRunLabelFailStore{Store: store}, legacyPoolOrderFormula); code != 0 {
+		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr)
+	}
+
+	root := workBeadByOrderLabel(t, store, "order-run:pool-patrol")
+	if root.Type != "molecule" || root.Status != "open" {
+		t.Fatalf("root type/status = %q/%q, want an open molecule root", root.Type, root.Status)
+	}
+}
+
 func TestOrderRunGraphWorkflowMissingRigDispatcherFailsBeforeInstantiate(t *testing.T) {
 	cityDir := t.TempDir()
 	formulaDir := t.TempDir()

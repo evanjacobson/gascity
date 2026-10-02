@@ -1130,6 +1130,30 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 	}, nil
 }
 
+// PromoteExpandedWorkflowRoot moves rootID from open to in_progress when it is
+// an expanded workflow root (beadmeta.IsExpandedWorkflowRoot). Launch paths
+// call it once the root is instantiated: such a root is a container whose child
+// steps are the work, so no worker claim takes it out of open, and consumers
+// that ask whether the run is live read in_progress.
+//
+// Every other bead is left as it is. A root-only workflow root and a marked
+// attempt root whose gc.kind is task are themselves the claimable work and must
+// stay open; a root that is already in_progress or closed has nothing to
+// promote. The call is therefore idempotent, so a launch path that replays can
+// repeat it. Store errors are returned unwrapped for the caller to put in its
+// own context.
+func PromoteExpandedWorkflowRoot(store beads.Store, rootID string) error {
+	root, err := store.Get(rootID)
+	if err != nil {
+		return err
+	}
+	if root.Status != "open" || !beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
+		return nil
+	}
+	status := "in_progress"
+	return store.Update(rootID, beads.UpdateOpts{Status: &status})
+}
+
 // InstantiateFragment creates beads from a rootless recipe fragment and stamps
 // them onto an existing workflow root.
 func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula.FragmentRecipe, opts FragmentOptions) (*FragmentResult, error) {

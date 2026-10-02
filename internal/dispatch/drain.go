@@ -1411,6 +1411,9 @@ func ensureDrainItemRoot(store beads.Store, control, unit, member beads.Bead, co
 		if candidate.Metadata[beadmeta.MoleculeFailedMetadataKey] == "true" {
 			continue
 		}
+		if err := promoteDrainItemRoot(store, control.ID, candidate.ID, opts); err != nil {
+			return "", false, err
+		}
 		return candidate.ID, false, nil
 	}
 	vars := make(map[string]string, len(parentVars))
@@ -1459,7 +1462,27 @@ func ensureDrainItemRoot(store beads.Store, control, unit, member beads.Bead, co
 		}
 		return "", false, fmt.Errorf("%s: instantiating drain item formula %q: %w", control.ID, itemFormula, err)
 	}
+	if err := promoteDrainItemRoot(store, control.ID, result.RootID, opts); err != nil {
+		return "", false, err
+	}
 	return result.RootID, true, nil
+}
+
+// promoteDrainItemRoot takes an expanded item root out of open (see
+// molecule.PromoteExpandedWorkflowRoot). ensureDrainItemRoot calls it on both
+// the adopt and the create branch, so a root whose promotion failed is promoted
+// by the pass that next adopts it by key. A failed promotion goes through the
+// controller spawn boundary like the other writes of the expansion: a transient
+// store error leaves the control pending for the next pass, and any other error
+// is recorded on the control and returned.
+func promoteDrainItemRoot(store beads.Store, controlID, rootID string, opts ProcessOptions) error {
+	if err := molecule.PromoteExpandedWorkflowRoot(store, rootID); err != nil {
+		if controllerSpawnBoundaryPending(store, controlID, err, opts) {
+			return ErrControlPending
+		}
+		return fmt.Errorf("%s: setting drain item root %s in_progress: %w", controlID, rootID, err)
+	}
+	return nil
 }
 
 func drainWorkflowExternalDeps(recipe *formula.Recipe, blockerIDs []string) []molecule.ExternalDep {

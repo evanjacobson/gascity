@@ -60,6 +60,20 @@ type selectiveUpdateFailStore struct {
 	beads.Store
 }
 
+type statusUpdateFailStore struct {
+	beads.Store
+}
+
+// getAfterOrderRunLabelFailStore fails every Get of a bead once that bead has
+// been stamped with an order-run label, so a launch path that re-reads the root
+// it just labeled surfaces as an error.
+type getAfterOrderRunLabelFailStore struct {
+	beads.Store
+
+	mu      sync.Mutex
+	labeled map[string]bool
+}
+
 type execLabelUpdateFailStore struct {
 	beads.Store
 }
@@ -184,6 +198,40 @@ func (s selectiveUpdateFailStore) Update(id string, opts beads.UpdateOpts) error
 		}
 	}
 	return s.Store.Update(id, opts)
+}
+
+func (s statusUpdateFailStore) Update(id string, opts beads.UpdateOpts) error {
+	if opts.Status != nil {
+		return fmt.Errorf("status update failed")
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s *getAfterOrderRunLabelFailStore) Update(id string, opts beads.UpdateOpts) error {
+	if err := s.Store.Update(id, opts); err != nil {
+		return err
+	}
+	for _, label := range opts.Labels {
+		if strings.HasPrefix(label, "order-run:") {
+			s.mu.Lock()
+			if s.labeled == nil {
+				s.labeled = make(map[string]bool)
+			}
+			s.labeled[id] = true
+			s.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+func (s *getAfterOrderRunLabelFailStore) Get(id string) (beads.Bead, error) {
+	s.mu.Lock()
+	labeled := s.labeled[id]
+	s.mu.Unlock()
+	if labeled {
+		return beads.Bead{}, fmt.Errorf("get after label failed")
+	}
+	return s.Store.Get(id)
 }
 
 func (s execLabelUpdateFailStore) Update(id string, opts beads.UpdateOpts) error {
@@ -1253,6 +1301,182 @@ title = "Cross-rig work"
 	}
 	if !rec.hasType(events.OrderCompleted) || rec.hasType(events.OrderFailed) {
 		t.Fatalf("events = %+v, want completed without failure", rec.events)
+	}
+}
+
+// expandedPoolOrderFormula is a graph.v2 order formula whose step is
+// materialized as a child bead, so its root is an expanded workflow root.
+const expandedPoolOrderFormula = `
+formula = "pool-order"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "work"
+title = "Pool work"
+`
+
+// rootOnlyPoolOrderFormula is the same graph.v2 order formula in the vapor
+// phase: only the root is created, so the root is itself the unit of work.
+const rootOnlyPoolOrderFormula = `
+formula = "pool-order"
+version = 2
+contract = "graph.v2"
+phase = "vapor"
+
+[[steps]]
+id = "work"
+title = "Pool work"
+`
+
+// legacyPoolOrderFormula is a v1 poured order formula: its root is a molecule
+// container, not a graph workflow root.
+const legacyPoolOrderFormula = `
+formula = "pool-order"
+version = 1
+
+[[steps]]
+id = "work"
+title = "Pool work"
+`
+
+// dispatchPoolOrder fires one tick of a city-scoped pool order running
+// formulaBody against store and returns the recorder and stderr the dispatch
+// wrote to.
+func dispatchPoolOrder(t *testing.T, store beads.Store, formulaBody string) (*memRecorder, *bytes.Buffer) {
+	t.Helper()
+	formulatest.EnableV2ForTest(t)
+	cityPath := t.TempDir()
+	formulaDir := t.TempDir()
+	writeFile(t, filepath.Join(formulaDir, "pool-order.toml"), formulaBody)
+	maxOne, maxTwo := 1, 2
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "worker", MaxActiveSessions: &maxTwo},
+			{Name: config.ControlDispatcherAgentName, MaxActiveSessions: &maxOne},
+		},
+	}
+	a := orders.Order{
+		Name:         "pool-patrol",
+		Formula:      "pool-order",
+		Pool:         "worker",
+		Trigger:      "cooldown",
+		Interval:     "15m",
+		FormulaLayer: formulaDir,
+	}
+	rec := &memRecorder{}
+	stderr := &bytes.Buffer{}
+	dispatchCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &memoryOrderDispatcher{
+		aa:                   []orders.Order{a},
+		storeFn:              func(execStoreTarget) (beads.Store, error) { return store, nil },
+		cfg:                  cfg,
+		cityName:             "test-city",
+		cityPath:             cityPath,
+		rec:                  rec,
+		stderr:               stderr,
+		maxDispatchesPerTick: 1,
+		dispatchCtx:          dispatchCtx,
+		dispatchCancel:       cancel,
+	}
+	m.dispatch(context.Background(), cityPath, time.Now())
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer drainCancel()
+	if !m.drain(drainCtx) {
+		t.Fatal("order dispatch did not drain")
+	}
+	return rec, stderr
+}
+
+// TestOrderDispatchPoolPromotesExpandedWorkflowRoot pins that a pool order
+// launches its expanded workflow root in_progress. The root is a container no
+// worker claims, so the dispatch is the only thing that can take it out of open.
+func TestOrderDispatchPoolPromotesExpandedWorkflowRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	rec, stderr := dispatchPoolOrder(t, store, expandedPoolOrderFormula)
+	if !rec.hasType(events.OrderCompleted) || rec.hasType(events.OrderFailed) {
+		t.Fatalf("events = %+v, want completed without failure; stderr: %s", rec.events, stderr)
+	}
+
+	root := workBeadByOrderLabel(t, store, "order-run:pool-patrol")
+	if !beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
+		t.Fatalf("root metadata = %#v, want an expanded workflow root", root.Metadata)
+	}
+	if got := root.Metadata[beadmeta.RoutedToMetadataKey]; got != "worker" {
+		t.Fatalf("root gc.routed_to = %q, want worker", got)
+	}
+	if root.Status != "in_progress" {
+		t.Fatalf("root status = %q, want in_progress", root.Status)
+	}
+}
+
+// TestOrderDispatchPoolKeepsRootOnlyWorkflowRootOpen pins the other half of the
+// promotion rule: a root-only workflow root carries the workflow kind but is
+// itself the claimable unit of work, so the dispatch must leave it open.
+func TestOrderDispatchPoolKeepsRootOnlyWorkflowRootOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	rec, stderr := dispatchPoolOrder(t, store, rootOnlyPoolOrderFormula)
+	if !rec.hasType(events.OrderCompleted) || rec.hasType(events.OrderFailed) {
+		t.Fatalf("events = %+v, want completed without failure; stderr: %s", rec.events, stderr)
+	}
+
+	root := workBeadByOrderLabel(t, store, "order-run:pool-patrol")
+	if got := root.Metadata[beadmeta.KindMetadataKey]; got != beadmeta.KindWorkflow {
+		t.Fatalf("root gc.kind = %q, want %q", got, beadmeta.KindWorkflow)
+	}
+	if beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
+		t.Fatalf("root metadata = %#v, want a root-only workflow root", root.Metadata)
+	}
+	if root.Status != "open" {
+		t.Fatalf("root status = %q, want open", root.Status)
+	}
+}
+
+// TestOrderDispatchRootPromotionFailureFailsTheOrder pins that a root the
+// dispatch could not promote is reported the way a failed root label is: on
+// stderr, as an order.failed event, and on the tracking bead.
+func TestOrderDispatchRootPromotionFailureFailsTheOrder(t *testing.T) {
+	store := beads.NewMemStore()
+	rec, stderr := dispatchPoolOrder(t, statusUpdateFailStore{Store: store}, expandedPoolOrderFormula)
+
+	if !rec.hasType(events.OrderFailed) || rec.hasType(events.OrderCompleted) {
+		t.Fatalf("events = %+v, want failed without completion", rec.events)
+	}
+	if !strings.Contains(stderr.String(), "status update failed") {
+		t.Fatalf("stderr = %q, want the promotion error", stderr.String())
+	}
+	hasFailed := false
+	for _, b := range trackingBeads(t, store, "order-run:pool-patrol") {
+		if hasLabel(b.Labels, "wisp-failed") {
+			hasFailed = true
+		}
+	}
+	if !hasFailed {
+		t.Fatal("tracking bead missing wisp-failed label after promotion failure")
+	}
+	// Promotion runs after the label, so the root that could not be promoted
+	// still carries the evidence the single-flight gate reads.
+	if root := workflowRoot(t, store); !hasLabel(root.Labels, "order-run:pool-patrol") {
+		t.Fatalf("root labels = %v, want order-run:pool-patrol kept after the failed promotion", root.Labels)
+	}
+}
+
+// TestOrderDispatchLegacyPoolOrderSkipsRootPromotion pins that only a graph
+// workflow launch considers promotion. A v1 order's root is never an expanded
+// workflow root, so the dispatch must not re-read it, and a store that cannot
+// serve that read must not fail an order that launched.
+func TestOrderDispatchLegacyPoolOrderSkipsRootPromotion(t *testing.T) {
+	store := beads.NewMemStore()
+	rec, stderr := dispatchPoolOrder(t, &getAfterOrderRunLabelFailStore{Store: store}, legacyPoolOrderFormula)
+	if !rec.hasType(events.OrderCompleted) || rec.hasType(events.OrderFailed) {
+		t.Fatalf("events = %+v, want completed without failure; stderr: %s", rec.events, stderr)
+	}
+
+	root := workBeadByOrderLabel(t, store, "order-run:pool-patrol")
+	if root.Type != "molecule" || root.Status != "open" {
+		t.Fatalf("root type/status = %q/%q, want an open molecule root", root.Type, root.Status)
 	}
 }
 

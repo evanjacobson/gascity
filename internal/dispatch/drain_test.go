@@ -61,6 +61,199 @@ func TestProcessDrainSeparateExpandsConvoyIntoUnitRoots(t *testing.T) {
 	}
 }
 
+// TestProcessDrainPromotesExpandedItemRoots pins that a drain launches each item
+// workflow with its root in_progress. An expanded item root is a container no
+// worker claims, so the drain is the only thing that can take it out of open.
+func TestProcessDrainPromotesExpandedItemRoots(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+	}{
+		{name: "separate"},
+		{name: "shared", metadata: map[string]string{
+			"gc.drain_context":       "shared",
+			"gc.drain_member_access": "exclusive",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			formulatest.EnableV2ForTest(t)
+			dir := t.TempDir()
+			writeDrainItemFormula(t, dir)
+			store, drain := seedDrainWorkflow(t)
+			if len(tt.metadata) > 0 {
+				if err := store.SetMetadataBatch(drain.ID, tt.metadata); err != nil {
+					t.Fatalf("SetMetadataBatch(drain): %v", err)
+				}
+				drain = mustGetBead(t, store, drain.ID)
+			}
+
+			if _, err := ProcessControl(store, drain, ProcessOptions{FormulaSearchPaths: []string{dir}}); err != nil {
+				t.Fatalf("ProcessControl(drain expand): %v", err)
+			}
+
+			promoted := 0
+			for _, row := range mustDrainManifest(t, mustGetBead(t, store, drain.ID)).Rows {
+				if row.ItemRootID == "" {
+					continue
+				}
+				root := mustGetBead(t, store, row.ItemRootID)
+				if !beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
+					t.Fatalf("item root %s metadata = %#v, want an expanded workflow root", root.ID, root.Metadata)
+				}
+				if root.Status != "in_progress" {
+					t.Fatalf("item root %s status = %q, want in_progress", root.ID, root.Status)
+				}
+				promoted++
+			}
+			if promoted == 0 {
+				t.Fatal("drain materialized no item roots")
+			}
+		})
+	}
+}
+
+// TestProcessDrainReplayPromotesOpenItemRootAndKeepsClosedOne pins the replay
+// half of item-root promotion: a root found by key that never left open is
+// promoted on the pass that adopts it, and one that already settled is adopted
+// as it stands rather than reopened.
+func TestProcessDrainReplayPromotesOpenItemRootAndKeepsClosedOne(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	store, drain := seedDrainWorkflow(t)
+
+	if _, err := ProcessControl(store, drain, ProcessOptions{FormulaSearchPaths: []string{dir}}); err != nil {
+		t.Fatalf("ProcessControl(drain expand): %v", err)
+	}
+	manifest := mustDrainManifest(t, mustGetBead(t, store, drain.ID))
+	closedRootID, openRootID := manifest.Rows[0].ItemRootID, manifest.Rows[1].ItemRootID
+	if err := updateMetadataAndClose(store, closedRootID, map[string]string{"gc.outcome": "pass"}); err != nil {
+		t.Fatalf("close item root: %v", err)
+	}
+	open := "open"
+	if err := store.Update(openRootID, beads.UpdateOpts{Status: &open}); err != nil {
+		t.Fatalf("reset item root to open: %v", err)
+	}
+	for i := range manifest.Rows {
+		manifest.Rows[i].ItemRootID = ""
+		manifest.Rows[i].Status = "unit-created"
+	}
+	if err := persistDrainManifest(store, drain.ID, manifest, map[string]string{"gc.drain_state": "expanding"}); err != nil {
+		t.Fatalf("persist rewound manifest: %v", err)
+	}
+
+	if _, err := ProcessControl(store, mustGetBead(t, store, drain.ID), ProcessOptions{FormulaSearchPaths: []string{dir}}); err != nil {
+		t.Fatalf("ProcessControl(drain replay): %v", err)
+	}
+
+	replayed := mustDrainManifest(t, mustGetBead(t, store, drain.ID))
+	if got := replayed.Rows[0].ItemRootID; got != closedRootID {
+		t.Fatalf("replayed row 0 item root = %q, want closed root %q", got, closedRootID)
+	}
+	if got := replayed.Rows[1].ItemRootID; got != openRootID {
+		t.Fatalf("replayed row 1 item root = %q, want existing root %q", got, openRootID)
+	}
+	if got := mustGetBead(t, store, closedRootID).Status; got != "closed" {
+		t.Fatalf("closed item root status = %q, want closed", got)
+	}
+	if got := mustGetBead(t, store, openRootID).Status; got != "in_progress" {
+		t.Fatalf("adopted item root status = %q, want in_progress", got)
+	}
+}
+
+// TestProcessDrainTransientItemRootPromotionErrorStaysPendingAndConverges pins
+// that an item root the drain could not promote because the store never
+// answered is retried rather than quarantined: the control stays open and
+// pending, the instantiated root is kept, and the next pass adopts that root by
+// key and promotes it instead of minting a second one.
+func TestProcessDrainTransientItemRootPromotionErrorStaysPendingAndConverges(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	base, drain := seedDrainWorkflow(t)
+	store := &failOnceStatusUpdateStore{
+		Store: base,
+		err:   errors.New("invalid connection: i/o timeout"),
+	}
+	opts := ProcessOptions{FormulaSearchPaths: []string{dir}}
+
+	if _, err := ProcessControl(store, drain, opts); !errors.Is(err, ErrControlPending) {
+		t.Fatalf("ProcessControl(drain expand) error = %v, want %v", err, ErrControlPending)
+	}
+	afterFailure := mustGetBead(t, store, drain.ID)
+	if afterFailure.Status != "open" {
+		t.Fatalf("control status after transient promotion error = %q, want open", afterFailure.Status)
+	}
+	if got := afterFailure.Metadata["gc.controller_error_class"]; got != "transient" {
+		t.Fatalf("controller error class = %q, want transient", got)
+	}
+	roots, err := store.ListByMetadata(map[string]string{"gc.drain_control_id": drain.ID, "gc.kind": "workflow"}, 0, beads.IncludeClosed)
+	if err != nil {
+		t.Fatalf("ListByMetadata(drain item roots): %v", err)
+	}
+	if len(roots) != 1 || roots[0].Status != "open" {
+		t.Fatalf("item roots after transient promotion error = %+v, want the one instantiated root still open", roots)
+	}
+	unpromotedRootID := roots[0].ID
+
+	if _, err := ProcessControl(store, mustGetBead(t, store, drain.ID), opts); err != nil {
+		t.Fatalf("ProcessControl(drain retry): %v", err)
+	}
+	manifest := mustDrainManifest(t, mustGetBead(t, store, drain.ID))
+	if got := manifest.Rows[0].ItemRootID; got != unpromotedRootID {
+		t.Fatalf("row 0 item root = %q, want the adopted root %q", got, unpromotedRootID)
+	}
+	if got := mustGetBead(t, store, unpromotedRootID).Status; got != "in_progress" {
+		t.Fatalf("adopted item root status = %q, want in_progress", got)
+	}
+	roots, err = store.ListByMetadata(map[string]string{"gc.item_root_key": manifest.Rows[0].ItemRootKey}, 0, beads.IncludeClosed)
+	if err != nil {
+		t.Fatalf("ListByMetadata(item root key): %v", err)
+	}
+	if len(roots) != 1 {
+		t.Fatalf("roots for row 0 item key = %d, want 1", len(roots))
+	}
+}
+
+// TestProcessDrainHardItemRootPromotionErrorClosesControl pins that an item
+// root promotion the store refused is recorded through the controller-error
+// path, the way a refused dependency write in the same flow is.
+func TestProcessDrainHardItemRootPromotionErrorClosesControl(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	base, drain := seedDrainWorkflow(t)
+	store := &failOnceStatusUpdateStore{
+		Store: base,
+		err:   errors.New("status update refused"),
+	}
+
+	_, err := ProcessControl(store, drain, ProcessOptions{FormulaSearchPaths: []string{dir}})
+	if err == nil || errors.Is(err, ErrControlPending) {
+		t.Fatalf("ProcessControl(drain expand) error = %v, want the hard promotion error", err)
+	}
+	if !strings.Contains(err.Error(), "setting drain item root") || !strings.Contains(err.Error(), "status update refused") {
+		t.Fatalf("ProcessControl(drain expand) error = %v, want the wrapped promotion error", err)
+	}
+	after := mustGetBead(t, store, drain.ID)
+	if after.Status != "closed" {
+		t.Fatalf("control status after hard promotion error = %q, want closed", after.Status)
+	}
+	if got := after.Metadata["gc.controller_error_class"]; got != "hard" {
+		t.Fatalf("controller error class = %q, want hard", got)
+	}
+	if got := after.Metadata["gc.final_disposition"]; got != "controller_error" {
+		t.Fatalf("final disposition = %q, want controller_error", got)
+	}
+	if got := after.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("control outcome = %q, want fail", got)
+	}
+	if !strings.Contains(after.Metadata["gc.controller_error"], "status update refused") {
+		t.Fatalf("gc.controller_error = %q, want the promotion error", after.Metadata["gc.controller_error"])
+	}
+}
+
 func TestProcessDrainSeparateProjectsMemberDependenciesOntoItemWorkflows(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	dir := t.TempDir()
@@ -1353,6 +1546,22 @@ type recordingDrainUnitStore struct {
 func (s *recordingDrainUnitStore) ListByMetadata(filters map[string]string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
 	s.listMetadataOpts = append(s.listMetadataOpts, opts)
 	return s.Store.ListByMetadata(filters, limit, opts...)
+}
+
+// failOnceStatusUpdateStore fails the first Update that sets in_progress, which
+// on a drain expansion is the item root's promotion.
+type failOnceStatusUpdateStore struct {
+	beads.Store
+	err    error
+	failed bool
+}
+
+func (s *failOnceStatusUpdateStore) Update(id string, opts beads.UpdateOpts) error {
+	if !s.failed && opts.Status != nil && *opts.Status == "in_progress" {
+		s.failed = true
+		return s.err
+	}
+	return s.Store.Update(id, opts)
 }
 
 type createObservingStore struct {

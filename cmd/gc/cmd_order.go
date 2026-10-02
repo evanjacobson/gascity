@@ -907,6 +907,16 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 		return 1
 	}
 
+	// An expanded workflow root is a container no worker claims, so the run
+	// takes it out of open itself, after the label and only for a graph
+	// workflow launch, for the same reasons dispatchWisp does.
+	if cookResult.GraphWorkflow {
+		if err := molecule.PromoteExpandedWorkflowRoot(moleculeStore, rootID); err != nil {
+			fmt.Fprintf(stderr, "gc order run: setting wisp %s in_progress: %v\n", rootID, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+
 	// Record the run in the order-tracking history index so a manual formula
 	// `gc order run` advances the cooldown clock, matching dispatcher-driven
 	// (order_dispatch.go) and event-exec (doOrderRunExecTracked) runs. The wisp

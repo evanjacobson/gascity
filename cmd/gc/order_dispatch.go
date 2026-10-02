@@ -2446,6 +2446,25 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		return
 	}
 
+	// An expanded workflow root is a container no worker claims, so the
+	// dispatch takes it out of open itself. It runs after the label so a root
+	// that could not be promoted still carries its order-run evidence and
+	// holds the single-flight gate. Only a graph workflow launch can produce
+	// such a root, so no other launch re-reads its root here.
+	if cookResult.GraphWorkflow {
+		if err := molecule.PromoteExpandedWorkflowRoot(graphStore, rootID); err != nil {
+			logDispatchError(m.stderr, "gc: order %s: failed to set wisp %s in_progress: %v", scoped, rootID, err)
+			m.rec.Record(events.Event{
+				Type:    events.OrderFailed,
+				Actor:   "controller",
+				Subject: scoped,
+				Message: fmt.Sprintf("wisp %s created but not set in_progress: %v", rootID, err),
+			})
+			m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
+			return
+		}
+	}
+
 	m.rec.Record(events.Event{
 		Type:    events.OrderCompleted,
 		Actor:   "controller",

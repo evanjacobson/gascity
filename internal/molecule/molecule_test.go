@@ -3,6 +3,7 @@ package molecule
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -3814,5 +3815,86 @@ func TestInstantiate_DeferredStepsStayGate(t *testing.T) {
 	}
 	if b.Type != "gate" {
 		t.Errorf("deferred step.Type = %q, want %q", b.Type, "gate")
+	}
+}
+
+// TestPromoteExpandedWorkflowRoot pins which roots a launch path moves out of
+// open. Only an expanded workflow root is a container nothing claims; a
+// root-only workflow root and a marked attempt root are themselves the work and
+// must stay open to be claimed, and a settled root must not be reopened.
+func TestPromoteExpandedWorkflowRoot(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		status   string
+		want     string
+	}{
+		{
+			name: "expanded workflow root is promoted",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "open",
+			want:   "in_progress",
+		},
+		{
+			name:     "root-only workflow root stays open",
+			metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
+			status:   "open",
+			want:     "open",
+		},
+		{
+			name: "marked attempt root stays open",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             "task",
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "open",
+			want:   "open",
+		},
+		{
+			name: "closed expanded workflow root stays closed",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "closed",
+			want:   "closed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			root, err := store.Create(beads.Bead{Title: "root", Type: "task", Metadata: tt.metadata})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if tt.status == "closed" {
+				if err := store.Close(root.ID); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			}
+
+			if err := PromoteExpandedWorkflowRoot(store, root.ID); err != nil {
+				t.Fatalf("PromoteExpandedWorkflowRoot: %v", err)
+			}
+
+			got, err := store.Get(root.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got.Status != tt.want {
+				t.Fatalf("status = %q, want %q", got.Status, tt.want)
+			}
+		})
+	}
+}
+
+// TestPromoteExpandedWorkflowRootReportsStoreErrors pins that a launch path
+// hears about a root it could not read, rather than treating it as promoted.
+func TestPromoteExpandedWorkflowRootReportsStoreErrors(t *testing.T) {
+	if err := PromoteExpandedWorkflowRoot(beads.NewMemStore(), "missing"); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("PromoteExpandedWorkflowRoot(missing) = %v, want beads.ErrNotFound", err)
 	}
 }
