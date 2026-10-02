@@ -225,6 +225,22 @@ func TestHookCandidateReclaimEligibleRefusesExpandedWorkflowRoot(t *testing.T) {
 // claim path with the shape a pool worker's query returns once an expanded
 // root is open and unassigned: the root ahead of one of its own routed steps.
 // The worker must claim the step and never attempt the root.
+//
+// Two layers refuse this row and doHookClaim runs both, so this test pins the
+// outcome, not either layer: it stays green with one of them removed. The hook
+// filter (filterUnreadyHookCandidates) drops the unassigned root before the
+// claim tiers see it, and the claim matcher (hookClaimMatchesRoute) refuses
+// its route. Each layer is pinned where it acts alone:
+//   - the matcher by
+//     TestDoHookClaimNeverReclaimsStaleExpandedWorkflowRoot, where the root
+//     carries an assignee and the filter keeps it;
+//   - the filter by
+//     TestClaimHookWorkNeverSelectsStoreHoldingOnlyExpandedWorkflowRoot, at
+//     federated store selection, which never consults the matcher.
+//
+// No claim tier takes an unassigned row without asking the matcher, so the
+// filter is never the only thing between an unassigned root and a claim
+// mutation; store selection is where it decides something by itself.
 func TestDoHookClaimSkipsExpandedWorkflowRootAndClaimsRoutedStep(t *testing.T) {
 	var attempts []string
 	runner := func(string, string) (string, error) {
@@ -261,6 +277,111 @@ func TestDoHookClaimSkipsExpandedWorkflowRootAndClaimsRoutedStep(t *testing.T) {
 	}
 	if result.Action != "work" || result.Reason != "claimed" || result.BeadID != "wf-step" {
 		t.Fatalf("unexpected claim result: %+v", result)
+	}
+}
+
+// TestDoHookClaimNeverReclaimsStaleExpandedWorkflowRoot pins the claim
+// matcher end to end, on the one claim path where the hook filter cannot act.
+// An expanded root held by a stale assignee is assigned, so
+// filterUnreadyHookCandidates keeps it (an assigned root may be its holder's
+// anchor) and it reaches the stale-lease reclaim tier. Only
+// hookClaimMatchesRoute stands between it and a reclaim there.
+func TestDoHookClaimNeverReclaimsStaleExpandedWorkflowRoot(t *testing.T) {
+	var reclaims, attempts []string
+	runner := func(string, string) (string, error) {
+		return `[
+			{"id":"wf-root","status":"in_progress","assignee":"dead-worker","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"worker","gc.workflow_expanded":"true"}},
+			{"id":"wf-step","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"wf-root"}}
+		]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		ReclaimStale: func(_ context.Context, _ string, _ []string, beadID string) (bool, string, error) {
+			reclaims = append(reclaims, beadID)
+			return true, "dead-worker", nil
+		},
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			attempts = append(attempts, beadID)
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
+		},
+		EmitHookClaimReclaimedStale: func(string, string, string) {},
+	}
+	opts := hookClaimOptions{
+		Assignee:               "worker-1",
+		IdentityCandidates:     []string{"worker-1"},
+		RouteTargets:           []string{"worker"},
+		AutoReclaimStaleClaims: true,
+		JSON:                   true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if len(reclaims) != 0 {
+		t.Fatalf("stale-lease reclaim attempted on %v, want none (an expanded workflow root is never reclaim-eligible)", reclaims)
+	}
+	if got := strings.Join(attempts, ","); got != "wf-step" {
+		t.Fatalf("claim attempts = %q, want wf-step only", got)
+	}
+}
+
+// TestClaimHookWorkNeverSelectsStoreHoldingOnlyExpandedWorkflowRoot pins the
+// hook filter end to end, where it decides alone. Federated store selection
+// (bestStoreWithWork) asks only whether a store's filtered output has ready
+// work and never consults the claim matcher, so the filter is what keeps a
+// store whose only candidate is an unassigned expanded root from being chosen
+// as the claim store. The root outranks the step on priority, so a selection
+// that counted it would commit to its store first and read it a second time
+// to re-validate before falling back.
+func TestClaimHookWorkNeverSelectsStoreHoldingOnlyExpandedWorkflowRoot(t *testing.T) {
+	stores := []hookStore{
+		{dir: "city", env: []string{"GC_STORE=city"}},
+		{dir: "riga", env: []string{"GC_STORE=riga"}},
+	}
+	reads := map[string]int{}
+	run := func(_, dir string, _ []string) (string, error) {
+		reads[dir]++
+		switch dir {
+		case "city":
+			return `[{"id":"wf-root","status":"open","priority":0,"metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"worker","gc.workflow_expanded":"true"}}]`, nil
+		case "riga":
+			return `[{"id":"wf-step","status":"open","priority":3,"metadata":{"gc.routed_to":"worker","gc.root_bead_id":"wf-root"}}]`, nil
+		default:
+			t.Fatalf("unexpected store dir %q", dir)
+			return "", nil
+		}
+	}
+	var claimDir string
+	ops := hookClaimOps{
+		Claim: func(_ context.Context, dir string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			claimDir = dir
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
+		},
+		ResolveWorkBranch: func(hookClaimWorkTree) string { return "" }, // suppress stamp noise
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := claimHookWorkWithRunner("bd ready --json", "city", stores[0].env, stores, opts, ops, run, func(string, error) {}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("claimHookWorkWithRunner = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.BeadID != "wf-step" || result.Reason != "claimed" || claimDir != "riga" {
+		t.Fatalf("claim result = %+v in dir %q, want wf-step claimed in riga", result, claimDir)
+	}
+	if reads["city"] != 1 {
+		t.Fatalf("city store read %d times, want 1: it is read once during selection and, holding only an expanded workflow root, must not be selected and re-validated as the claim store", reads["city"])
 	}
 }
 
