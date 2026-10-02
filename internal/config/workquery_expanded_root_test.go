@@ -103,6 +103,15 @@ func booleanMarkerRowsJSON(t *testing.T, rows []expandedRootRow) string {
 		if !strings.Contains(encoded, marker+`"`+value+`"`) {
 			t.Fatalf("corpus carries no %s marker to re-encode as a boolean: %s", value, encoded)
 		}
+	}
+	return expandedMarkersAsBooleans(encoded)
+}
+
+// expandedMarkersAsBooleans re-encodes every "true" or "false" expanded marker
+// in encoded rows as the JSON boolean of the same text.
+func expandedMarkersAsBooleans(encoded string) string {
+	marker := `"` + beadmeta.WorkflowExpandedMetadataKey + `":`
+	for _, value := range []string{"true", "false"} {
 		encoded = strings.ReplaceAll(encoded, marker+`"`+value+`"`, marker+value)
 	}
 	return encoded
@@ -426,6 +435,90 @@ func TestPoolDemandQueryReadsABooleanExpandedMarker(t *testing.T) {
 	}
 }
 
+// TestRunTargetReadsApplyTheExpandedRootRuleToEveryMarkerEncoding pins the
+// outcome for a workflow root routed by gc.run_target alone, in each tier that
+// can reach one: the legacy tier's ready read and the ephemeral tier. A root
+// marked expanded is neither served nor counted whether the store holds the
+// marker as the string "true" or the JSON boolean true; a root-only root and a
+// root marked false are still served and counted.
+//
+// The legacy ready read has one filter, so its cases pin that filter. The
+// ephemeral tier's cases pin the tier as a whole: its selector refuses an
+// expanded root both in the run_target arm and in the serve-rule clause behind
+// it, and no row tells the two apart.
+func TestRunTargetReadsApplyTheExpandedRootRuleToEveryMarkerEncoding(t *testing.T) {
+	a := &Agent{Name: "worker", Dir: "hello-world"}
+	const rootID = "run-target-root"
+	runTargetRootJSON := func(marker string, boolean bool) string {
+		metadata := map[string]string{
+			beadmeta.KindMetadataKey:      beadmeta.KindWorkflow,
+			beadmeta.RunTargetMetadataKey: expandedRootRoute,
+		}
+		if marker != "" {
+			metadata[beadmeta.WorkflowExpandedMetadataKey] = marker
+		}
+		encoded := expandedRootRowsJSON(t, expandedRootRow{ID: rootID, Status: "open", Metadata: metadata})
+		if boolean {
+			return expandedMarkersAsBooleans(encoded)
+		}
+		return encoded
+	}
+
+	for _, read := range []struct {
+		name      string
+		ephemeral bool
+		reader    func(rows string) string
+	}{
+		{
+			name: "legacy ready read",
+			reader: func(rows string) string {
+				return fakePoolDemandReader("[]", fakeReadyArm{glob: runTargetReadGlob(expandedRootRoute), rows: rows})
+			},
+		},
+		{
+			name:      "ephemeral tier",
+			ephemeral: true,
+			reader:    func(rows string) string { return fakePoolDemandReader(rows) },
+		},
+	} {
+		for _, tc := range []struct {
+			name    string
+			marker  string
+			boolean bool
+			served  bool
+		}{
+			{name: "boolean true marker", marker: "true", boolean: true},
+			{name: "string true marker", marker: "true"},
+			{name: "no marker", served: true},
+			{name: "boolean false marker", marker: "false", boolean: true, served: true},
+		} {
+			reader := read.reader(runTargetRootJSON(tc.marker, tc.boolean))
+			wantServed, wantCount := []string{}, "0"
+			if tc.served {
+				wantServed, wantCount = []string{rootID}, "1"
+			}
+			for _, tp := range expandedRootTopologies() {
+				if read.ephemeral && tp.topo.includeEphemeralReady() {
+					continue
+				}
+				for _, q := range firstRowQueries() {
+					t.Run(read.name+"/"+tc.name+"/"+q.name+"/"+tp.name, func(t *testing.T) {
+						got := servedIDOrder(t, q.build(a, tp.topo), reader)
+						if !reflect.DeepEqual(got, wantServed) {
+							t.Fatalf("%s served %v, want %v (only a workflow root marked true, in either encoding, is an expanded root)", read.name, got, wantServed)
+						}
+					})
+				}
+				t.Run(read.name+"/"+tc.name+"/PoolDemand/"+tp.name, func(t *testing.T) {
+					if got := demandCount(t, a.EffectivePoolDemandQueryFor(tp.topo), reader); got != wantCount {
+						t.Fatalf("pool-demand count = %q, want %q (only a workflow root marked true, in either encoding, is an expanded root)", got, wantCount)
+					}
+				})
+			}
+		}
+	}
+}
+
 // unparseableRoutedPayload is a reader payload jq cannot parse: a diagnostic
 // line ahead of the array.
 const unparseableRoutedPayload = `warning: store compacted
@@ -526,8 +619,8 @@ func TestPoolDemandServeRulesJQSelectClauses(t *testing.T) {
 // TestExpandedRootRuleIsRenderedOncePerPoolDemandRead pins where the rule is
 // applied: once on the routed read, and once in the ephemeral selector on the
 // topologies that have an ephemeral tier — in the worker's first-row form and
-// the reconciler's count form alike. The legacy gc.run_target tier keeps its own
-// filter and carries no copy.
+// the reconciler's count form alike. The legacy gc.run_target tier renders the
+// same predicate inside its own filter and carries no copy of the clause.
 func TestExpandedRootRuleIsRenderedOncePerPoolDemandRead(t *testing.T) {
 	kinds := append(firstRowQueries(), firstRowQuery{"PoolDemand", (*Agent).EffectivePoolDemandQueryFor})
 	for _, shape := range []parityShape{

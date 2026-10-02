@@ -270,7 +270,7 @@ func bdReadyPoolDemandMigrationShell(limitFlag string, topo QueryTopology) strin
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
-	filter := `[.[] | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and (` + jqMeta(beadmeta.WorkflowExpandedMetadataKey) + ` != "true"))]`
+	filter := `[.[] | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and ((` + expandedWorkflowRootJQPredicate() + `) | not))]`
 	if limit > 0 {
 		filter += ` | .[:` + strconv.Itoa(limit) + `]`
 	}
@@ -367,7 +367,7 @@ func legacyEphemeralPoolDemandShell(limit int, topo QueryTopology, quiet bool) s
 	}
 	filter := legacyEphemeralReadyFilterJQ(
 		`select((.assignee // "") == "")`+
-			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`") and (`+jqMeta(beadmeta.WorkflowExpandedMetadataKey)+` != "true")))`+
+			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`") and ((`+expandedWorkflowRootJQPredicate()+`) | not)))`+
 			PoolDemandServeRulesForQuery().JQSelectClauses(),
 		limit,
 		true,

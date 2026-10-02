@@ -470,14 +470,22 @@ func TestGoPredicateAndGeneratedQueryAgreeRowByRow(t *testing.T) {
 // which are not already expanded into real child steps — the same two gates the
 // Go side applies in controllerDemandRouteCandidates: run_target is consulted
 // only when there is no canonical route, and only for a root the fallback may
-// still speak for (workflowRunTargetFallbackEligible, #5900). Mirroring those
-// jq clauses here is the single restatement in this conformance, and
-// assertLegacyTierFilterUnchanged is what keeps it honest.
+// still speak for (workflowRunTargetFallbackEligible, #5900).
+//
+// Those jq clauses are restated here by hand, and this is the single
+// restatement in this conformance. The expanded gate is the filter's own
+// comparison — gc.kind equal to workflow and the marker equal to "true", on the
+// metadata strings as stored — and deliberately not a call to
+// beadmeta.IsExpandedWorkflowRoot: the counted side decides through that
+// predicate, so a served side that called it too would compare the predicate
+// with itself. assertLegacyTierFilterUnchanged is what keeps the restatement
+// honest.
 func legacyWorkflowTierServes(bead beads.Bead, opts readyOpts, metaWant []metadataFieldFilter) bool {
 	if !workerIsServed(bead, opts, metaWant) {
 		return false
 	}
-	if strings.TrimSpace(bead.Metadata[beadmeta.WorkflowExpandedMetadataKey]) == "true" {
+	if bead.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow &&
+		bead.Metadata[beadmeta.WorkflowExpandedMetadataKey] == "true" {
 		return false
 	}
 	return strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey]) == ""
@@ -516,7 +524,7 @@ func assertLegacyTierFilterUnchanged(t *testing.T, query string) {
 	// poolDemandFirstRowFunctionScript, brackets and limit slice included. The
 	// query is compared with the sh -c single-quote escaping undone, so the pin
 	// holds the jq PROGRAM rather than the quoting of the shell wrapper around it.
-	const wantFilter = `jq '[.[] | select(((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.workflow_expanded"] // "") != "true"))] | .[:1]'`
+	const wantFilter = `jq '[.[] | select(((.metadata["gc.routed_to"] // "") == "") and ((((.metadata["gc.kind"] // "") == "workflow") and (((.metadata["gc.workflow_expanded"] // "") | tostring) == "true")) | not))] | .[:1]'`
 	if !strings.Contains(unescapeShellSingleQuotes(query), wantFilter) {
 		t.Fatalf("the legacy workflow tier's post-filter is no longer exactly\n  %s\nso the Go mirror in legacyWorkflowTierServes is unpinned. Re-derive the mirror against the new filter, then update this pin.\nGenerated query:\n%s", wantFilter, query)
 	}
