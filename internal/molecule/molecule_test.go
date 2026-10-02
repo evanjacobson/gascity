@@ -3818,10 +3818,41 @@ func TestInstantiate_DeferredStepsStayGate(t *testing.T) {
 	}
 }
 
-// TestPromoteExpandedWorkflowRoot pins which roots a launch path moves out of
-// open. Only an expanded workflow root is a container nothing claims; a
+// TestIsLaunchPromotableStatus pins the one status rule every launch promotion
+// shares: a bead nothing has started is promotable, however its status is
+// spelled, and a bead that is already running, parked or settled is not.
+func TestIsLaunchPromotableStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{status: "", want: true},
+		{status: "open", want: true},
+		{status: "ready", want: true},
+		{status: "todo", want: true},
+		{status: "triage", want: true},
+		{status: "backlog", want: true},
+		{status: "  Open\t", want: true},
+		{status: "READY", want: true},
+		{status: "in_progress", want: false},
+		{status: "closed", want: false},
+		{status: "blocked", want: false},
+		{status: " CLOSED ", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%q", tt.status), func(t *testing.T) {
+			if got := IsLaunchPromotableStatus(tt.status); got != tt.want {
+				t.Fatalf("IsLaunchPromotableStatus(%q) = %v, want %v", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPromoteExpandedWorkflowRoot pins which roots a launch path promotes to
+// in_progress. Only an expanded workflow root is a container nothing claims; a
 // root-only workflow root and a marked attempt root are themselves the work and
-// must stay open to be claimed, and a settled root must not be reopened.
+// must stay claimable whatever their status, and a root that is already
+// running, parked or settled is left alone.
 func TestPromoteExpandedWorkflowRoot(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -3839,10 +3870,34 @@ func TestPromoteExpandedWorkflowRoot(t *testing.T) {
 			want:   "in_progress",
 		},
 		{
+			name: "expanded workflow root with an empty status is promoted",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "",
+			want:   "in_progress",
+		},
+		{
+			name: "ready expanded workflow root is promoted",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "ready",
+			want:   "in_progress",
+		},
+		{
 			name:     "root-only workflow root stays open",
 			metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
 			status:   "open",
 			want:     "open",
+		},
+		{
+			name:     "ready root-only workflow root stays ready",
+			metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
+			status:   "ready",
+			want:     "ready",
 		},
 		{
 			name: "marked attempt root stays open",
@@ -3862,6 +3917,24 @@ func TestPromoteExpandedWorkflowRoot(t *testing.T) {
 			status: "closed",
 			want:   "closed",
 		},
+		{
+			name: "blocked expanded workflow root stays blocked",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "blocked",
+			want:   "blocked",
+		},
+		{
+			name: "in_progress expanded workflow root stays in_progress",
+			metadata: map[string]string{
+				beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+				beadmeta.WorkflowExpandedMetadataKey: "true",
+			},
+			status: "in_progress",
+			want:   "in_progress",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3870,9 +3943,15 @@ func TestPromoteExpandedWorkflowRoot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create: %v", err)
 			}
-			if tt.status == "closed" {
+			switch tt.status {
+			case "open":
+			case "closed":
 				if err := store.Close(root.ID); err != nil {
 					t.Fatalf("Close: %v", err)
+				}
+			default:
+				if err := store.Update(root.ID, beads.UpdateOpts{Status: &tt.status}); err != nil {
+					t.Fatalf("Update: %v", err)
 				}
 			}
 

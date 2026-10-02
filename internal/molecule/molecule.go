@@ -1130,24 +1130,38 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 	}, nil
 }
 
-// PromoteExpandedWorkflowRoot moves rootID from open to in_progress when it is
-// an expanded workflow root (beadmeta.IsExpandedWorkflowRoot). Launch paths
-// call it once the root is instantiated: such a root is a container whose child
-// steps are the work, so no worker claim takes it out of open, and consumers
-// that ask whether the run is live read in_progress.
+// IsLaunchPromotableStatus reports whether status, compared trimmed and
+// case-insensitively, is one a launch may promote to in_progress from: the
+// bead has not been started. It is the single status rule for every launch
+// promotion; which beads a launch promotes is each caller's own decision.
+func IsLaunchPromotableStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "open", "ready", "todo", "triage", "backlog":
+		return true
+	default:
+		return false
+	}
+}
+
+// PromoteExpandedWorkflowRoot moves rootID to in_progress when it is an
+// expanded workflow root (beadmeta.IsExpandedWorkflowRoot) whose status is
+// launch-promotable (IsLaunchPromotableStatus). Launch paths call it once the
+// root is instantiated: such a root is a container whose child steps are the
+// work, so no worker claim takes it out of open, and consumers that ask whether
+// the run is live read in_progress.
 //
 // Every other bead is left as it is. A root-only workflow root and a marked
-// attempt root whose gc.kind is task are themselves the claimable work and must
-// stay open; a root that is already in_progress or closed has nothing to
-// promote. The call is therefore idempotent, so a launch path that replays can
-// repeat it. Store errors are returned unwrapped for the caller to put in its
-// own context.
+// attempt root whose gc.kind is task are themselves the claimable work and keep
+// their status for a worker to claim; a root that is already in_progress,
+// blocked or closed has nothing to promote. The call is therefore idempotent,
+// so a launch path that replays can repeat it. Store errors are returned
+// unwrapped for the caller to put in its own context.
 func PromoteExpandedWorkflowRoot(store beads.Store, rootID string) error {
 	root, err := store.Get(rootID)
 	if err != nil {
 		return err
 	}
-	if root.Status != "open" || !beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
+	if !IsLaunchPromotableStatus(root.Status) || !beadmeta.IsExpandedWorkflowRoot(root.Metadata) {
 		return nil
 	}
 	status := "in_progress"

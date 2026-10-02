@@ -1639,12 +1639,7 @@ func mapsCloneWithout(in map[string]string, drop string) map[string]string {
 // ShouldPromoteWorkflowLaunchStatus reports whether a bead's status should
 // be promoted to in_progress when a workflow launches.
 func ShouldPromoteWorkflowLaunchStatus(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "", "open", "ready", "todo", "triage", "backlog":
-		return true
-	default:
-		return false
-	}
+	return molecule.IsLaunchPromotableStatus(status)
 }
 
 // PromoteWorkflowLaunchBead sets a bead to in_progress if its current status
