@@ -550,15 +550,21 @@ exit %d
 	return logPath
 }
 
+// writeRecordingTimeout installs a recording timeout double under both names
+// _bounded.sh resolves. The script prefers gtimeout, so a double named only
+// timeout is bypassed on macOS hosts where Homebrew coreutils puts a real
+// gtimeout on PATH.
 func writeRecordingTimeout(t *testing.T, binDir string) string {
 	t.Helper()
 	logPath := filepath.Join(binDir, "timeout.log")
-	writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
+	for _, name := range []string{"timeout", "gtimeout"} {
+		writeExecutable(t, filepath.Join(binDir, name), fmt.Sprintf(`#!/bin/sh
 printf 'timeout %%s\n' "$*" >> %s
 [ "$1" = "--kill-after=2" ] && shift
 shift
 exec "$@"
 `, shellQuote(logPath)))
+	}
 	return logPath
 }
 
