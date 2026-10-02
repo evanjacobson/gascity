@@ -1325,25 +1325,45 @@ func buildOnDeath(a *Agent, topo QueryTopology) string {
 		route = a.PoolName
 	}
 	_ = topo
+	// Each row is id, whether it is an expanded workflow root, gc.run_target,
+	// gc.routed_to. The rule is kind AND marker: a root-only workflow root and a
+	// marked attempt root are work and read "false". The loop's tab-separated
+	// read collapses empty fields, so a row without an id is dropped here, and
+	// the flag, which is never empty, comes before the two routes, which the
+	// loop only tests for being non-empty.
+	rowTSV := `select((.id // "") != "") | [.id, ((` + expandedWorkflowRootJQPredicate() + `) | tostring), ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv`
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
-	// Reset both assignee and status: clearing assignee alone leaves the bead
-	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
-	// 2/3 only match "ready" status). The next worker re-claims via Tier 3.
-	// If routed metadata is missing entirely, backfill the canonical
-	// gc.run_target route so reopened direct-assigned work does not stay
-	// invisible.
+		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | ` + rowTSV + `' 2>/dev/null; `
+	release := func(args string) string {
+		return `if ! err=$(bd update "$id" --assignee ""` + args + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; `
+	}
+	// An expanded workflow root is a container that stays in_progress and
+	// ownerless while its child steps run, and nothing claims it once it is
+	// open. It is released by clearing its assignee alone. An unrouted one
+	// gets no gc.run_target backfill: the backfill keeps a reopened row
+	// reachable, this row is not reopened, and the controller's orphan release
+	// reopens an in_progress, unassigned workflow root that is routed by
+	// gc.run_target alone.
+	//
+	// Every other row is work. Reset both assignee and status: clearing
+	// assignee alone leaves the bead invisible to every work_query tier (Tier 1
+	// needs assignee match, Tiers 2/3 only match "ready" status). The next
+	// worker re-claims via Tier 3. If routed metadata is missing entirely,
+	// backfill the canonical gc.run_target route so reopened direct-assigned
+	// work does not stay invisible.
 	return `{ ` +
 		`bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
-		`jq -r '.[] | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; ` +
+		`jq -r '.[] | ` + rowTSV + `' 2>/dev/null; ` +
 		ephemeralRead +
 		`} | ` +
-		`while IFS="$(printf '\t')" read -r id run_target routed_to; do ` +
-		`[ -z "$id" ] && continue; ` +
-		`if [ -n "$run_target" ] || [ -n "$routed_to" ]; then ` +
-		`if ! err=$(bd update "$id" --assignee "" --status open 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
-		`else if ! err=$(bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
+		`while IFS="$(printf '\t')" read -r id expanded_root run_target routed_to; do ` +
+		`if [ "$expanded_root" = "true" ]; then ` +
+		release(``) +
+		`elif [ -n "$run_target" ] || [ -n "$routed_to" ]; then ` +
+		release(` --status open`) +
+		`else ` +
+		release(` --status open --set-metadata `+shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route)) +
 		`fi; ` +
 		`done`
 }
