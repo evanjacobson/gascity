@@ -3,11 +3,13 @@ package sling
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -196,6 +198,421 @@ func TestDoSlingRefusesFormulaBackedRouteOfExpandedWorkflowRoot(t *testing.T) {
 				}
 				if len(router.routed) != 0 {
 					t.Fatalf("router calls = %#v, want none", router.routed)
+				}
+			})
+		}
+	}
+}
+
+// expandedWorkflowRootOrigin is the pool the fixture's expanded workflow root
+// is routed to. No test slings to it, so the batch's already-routed skip never
+// hides the root.
+const expandedWorkflowRootOrigin = "origin-pool"
+
+// expandedWorkflowRootConvoyFixture seeds store with a convoy tracking one
+// open expanded workflow root, which has one step, and one plain task, in that
+// order, and returns the convoy, the root and the task.
+func expandedWorkflowRootConvoyFixture(t *testing.T, store beads.Store) (convoy, root, task beads.Bead) {
+	t.Helper()
+	convoy, err := store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("store.Create(convoy): %v", err)
+	}
+	root, err = store.Create(beads.Bead{
+		Title:  "workflow",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey:  beadmeta.FormulaContractGraphV2,
+			beadmeta.WorkflowExpandedMetadataKey: "true",
+			beadmeta.RoutedToMetadataKey:         expandedWorkflowRootOrigin,
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create(root): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:    "step",
+		Type:     "task",
+		Status:   "in_progress",
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID},
+	}); err != nil {
+		t.Fatalf("store.Create(step): %v", err)
+	}
+	task, err = store.Create(beads.Bead{Title: "task", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("store.Create(task): %v", err)
+	}
+	for _, id := range []string{root.ID, task.ID} {
+		if err := convoycore.TrackItem(store, convoy.ID, id); err != nil {
+			t.Fatalf("TrackItem(%s): %v", id, err)
+		}
+	}
+	return convoy, root, task
+}
+
+// formulaBackedBatchRoutes are the two routes on which a convoy batch attaches
+// a formula to each open child: the target's default_sling_formula and an
+// explicit --on.
+var formulaBackedBatchRoutes = []struct {
+	name       string
+	target     config.Agent
+	onFormula  string
+	wantMethod string
+}{
+	{
+		name:       "default formula",
+		target:     config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("code-review")},
+		wantMethod: "batch-default-on",
+	},
+	{
+		name:       "explicit on",
+		target:     config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)},
+		onFormula:  "code-review",
+		wantMethod: "batch-on",
+	},
+}
+
+// formulaBackedBatchModes run each formula-backed batch route without and with
+// --force, which does not lift the refusal.
+var formulaBackedBatchModes = []struct {
+	name  string
+	force bool
+}{
+	{name: "plain"},
+	{name: "force", force: true},
+}
+
+// TestDoSlingBatchFailsExpandedWorkflowRootChild pins the refusal on the
+// convoy per-child path, which does not pass through preflight. On a
+// formula-backed batch the expanded root child fails with the typed
+// *ExpandedWorkflowRootError and is left untouched, and its sibling still gets
+// the formula attached and is routed.
+func TestDoSlingBatchFailsExpandedWorkflowRootChild(t *testing.T) {
+	for _, route := range formulaBackedBatchRoutes {
+		for _, mode := range formulaBackedBatchModes {
+			t.Run(route.name+"/"+mode.name, func(t *testing.T) {
+				runner := newFakeRunner()
+				cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+				deps := testDeps(cfg, runtime.NewFake(), runner.run)
+				convoy, root, task := expandedWorkflowRootConvoyFixture(t, deps.Store)
+
+				opts := testOpts(route.target, convoy.ID)
+				opts.OnFormula = route.onFormula
+				opts.Force = mode.force
+				result, err := DoSlingBatch(opts, deps, deps.Store)
+				var refused *ExpandedWorkflowRootError
+				if !errors.As(err, &refused) {
+					t.Fatalf("DoSlingBatch error = %T %[1]v, want ExpandedWorkflowRootError (children = %+v)", err, result.Children)
+				}
+				if refused.BeadID != root.ID {
+					t.Fatalf("ExpandedWorkflowRootError.BeadID = %q, want %q", refused.BeadID, root.ID)
+				}
+
+				if result.Method != route.wantMethod {
+					t.Fatalf("Method = %q, want %q", result.Method, route.wantMethod)
+				}
+				if result.Total != 2 || result.Routed != 1 || result.Failed != 1 {
+					t.Fatalf("total=%d routed=%d failed=%d, want total=2 routed=1 failed=1", result.Total, result.Routed, result.Failed)
+				}
+				if len(result.Children) != 2 {
+					t.Fatalf("children = %+v, want the root then the task", result.Children)
+				}
+				wantRoot := SlingChildResult{BeadID: root.ID, Failed: true, FailReason: refused.Error()}
+				if result.Children[0] != wantRoot {
+					t.Fatalf("root child result = %+v, want %+v", result.Children[0], wantRoot)
+				}
+				sibling := result.Children[1]
+				if sibling.BeadID != task.ID || !sibling.Routed || sibling.Failed || sibling.WispRootID == "" || sibling.FormulaName != "code-review" {
+					t.Fatalf("task child result = %+v, want %s routed with a code-review wisp", sibling, task.ID)
+				}
+
+				after, err := deps.Store.Get(root.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", root.ID, err)
+				}
+				if !reflect.DeepEqual(after, root) {
+					t.Fatalf("root = %+v, want unchanged %+v", after, root)
+				}
+				gotTask, err := deps.Store.Get(task.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", task.ID, err)
+				}
+				if gotTask.Metadata[beadmeta.MoleculeIDMetadataKey] != sibling.WispRootID {
+					t.Fatalf("task molecule_id = %q, want %q", gotTask.Metadata[beadmeta.MoleculeIDMetadataKey], sibling.WispRootID)
+				}
+				if len(runner.calls) != 1 || !strings.Contains(runner.calls[0], task.ID) {
+					t.Fatalf("runner calls = %#v, want the one route call for %s", runner.calls, task.ID)
+				}
+			})
+		}
+	}
+}
+
+// TestDoSlingBatchRefusesExpandedWorkflowRootChildBeforeFormulaPreCheck pins
+// that a formula batch sets the refused child aside before its attachment
+// pre-check, which burns a live molecule on an unassigned child it is about to
+// attach a formula to. A refused root carrying such a molecule, and the
+// molecule itself, come through unchanged.
+func TestDoSlingBatchRefusesExpandedWorkflowRootChildBeforeFormulaPreCheck(t *testing.T) {
+	for _, route := range formulaBackedBatchRoutes {
+		for _, mode := range formulaBackedBatchModes {
+			t.Run(route.name+"/"+mode.name, func(t *testing.T) {
+				cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+				deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+				convoy, root, task := expandedWorkflowRootConvoyFixture(t, deps.Store)
+				wisp, err := deps.Store.Create(beads.Bead{Title: "attached", Type: "molecule", Status: "open"})
+				if err != nil {
+					t.Fatalf("store.Create(wisp): %v", err)
+				}
+				if err := deps.Store.SetMetadata(root.ID, beadmeta.MoleculeIDMetadataKey, wisp.ID); err != nil {
+					t.Fatalf("SetMetadata(%s molecule_id): %v", root.ID, err)
+				}
+				rootBefore, err := deps.Store.Get(root.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", root.ID, err)
+				}
+				wispBefore, err := deps.Store.Get(wisp.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", wisp.ID, err)
+				}
+
+				opts := testOpts(route.target, convoy.ID)
+				opts.OnFormula = route.onFormula
+				opts.Force = mode.force
+				result, err := DoSlingBatch(opts, deps, deps.Store)
+				var refused *ExpandedWorkflowRootError
+				if !errors.As(err, &refused) || refused.BeadID != root.ID {
+					t.Errorf("DoSlingBatch error = %T %[1]v, want ExpandedWorkflowRootError for %s", err, root.ID)
+				}
+				if len(result.AutoBurned) != 0 {
+					t.Errorf("AutoBurned = %v, want none", result.AutoBurned)
+				}
+				if result.Routed != 1 || result.Failed != 1 {
+					t.Errorf("routed=%d failed=%d, want routed=1 failed=1", result.Routed, result.Failed)
+				}
+
+				rootAfter, err := deps.Store.Get(root.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", root.ID, err)
+				}
+				if !reflect.DeepEqual(rootAfter, rootBefore) {
+					t.Errorf("root = %+v, want unchanged %+v", rootAfter, rootBefore)
+				}
+				wispAfter, err := deps.Store.Get(wisp.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", wisp.ID, err)
+				}
+				if !reflect.DeepEqual(wispAfter, wispBefore) {
+					t.Errorf("attached molecule = %+v, want unchanged %+v", wispAfter, wispBefore)
+				}
+				gotTask, err := deps.Store.Get(task.ID)
+				if err != nil {
+					t.Fatalf("store.Get(%s): %v", task.ID, err)
+				}
+				if gotTask.Metadata[beadmeta.MoleculeIDMetadataKey] == "" {
+					t.Errorf("task molecule_id is empty, want the formula attached to the sibling")
+				}
+			})
+		}
+	}
+}
+
+// TestDoSlingBatchDryRunRefusesExpandedWorkflowRootChild pins that a
+// formula-backed batch dry-run reports what the real run does: the expanded
+// root child is refused with the typed error and counted as failed, its
+// sibling as routable, and nothing is mutated.
+func TestDoSlingBatchDryRunRefusesExpandedWorkflowRootChild(t *testing.T) {
+	for _, route := range formulaBackedBatchRoutes {
+		for _, mode := range formulaBackedBatchModes {
+			t.Run(route.name+"/"+mode.name, func(t *testing.T) {
+				runner := newFakeRunner()
+				cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+				deps := testDeps(cfg, runtime.NewFake(), runner.run)
+				convoy, root, _ := expandedWorkflowRootConvoyFixture(t, deps.Store)
+				before, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+				if err != nil {
+					t.Fatalf("list beads: %v", err)
+				}
+
+				opts := testOpts(route.target, convoy.ID)
+				opts.OnFormula = route.onFormula
+				opts.Force = mode.force
+				opts.DryRun = true
+				result, err := DoSlingBatch(opts, deps, deps.Store)
+				var refused *ExpandedWorkflowRootError
+				if !errors.As(err, &refused) {
+					t.Fatalf("DoSlingBatch dry-run error = %T %[1]v, want ExpandedWorkflowRootError (routed=%d failed=%d)", err, result.Routed, result.Failed)
+				}
+				if refused.BeadID != root.ID {
+					t.Fatalf("ExpandedWorkflowRootError.BeadID = %q, want %q", refused.BeadID, root.ID)
+				}
+				if !result.DryRun {
+					t.Fatal("result.DryRun = false, want true")
+				}
+				if result.Total != 2 || result.Routed != 1 || result.Failed != 1 {
+					t.Fatalf("total=%d routed=%d failed=%d, want total=2 routed=1 failed=1", result.Total, result.Routed, result.Failed)
+				}
+
+				after, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+				if err != nil {
+					t.Fatalf("list beads: %v", err)
+				}
+				if !reflect.DeepEqual(after, before) {
+					t.Fatalf("store changed under dry-run:\n got %+v\nwant %+v", after, before)
+				}
+				if len(runner.calls) != 0 {
+					t.Fatalf("runner calls = %#v, want none", runner.calls)
+				}
+			})
+		}
+	}
+}
+
+// TestDoSlingBatchPlainRoutesExpandedWorkflowRootChild pins that the batch
+// refusal, like the single-bead one, is about attaching a formula. A convoy
+// slung with no formula in play routes its expanded root child with its
+// sibling, attaches nothing, and leaves a molecule the root already carries
+// alone; a dry-run counts both children as routable.
+func TestDoSlingBatchPlainRoutesExpandedWorkflowRootChild(t *testing.T) {
+	plain := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	withDefault := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("code-review")}
+	tests := []struct {
+		name          string
+		target        config.Agent
+		noFormula     bool
+		force         bool
+		dryRun        bool
+		wantRouteCmds int
+	}{
+		{name: "no default formula", target: plain, wantRouteCmds: 2},
+		{name: "no default formula/force", target: plain, force: true, wantRouteCmds: 2},
+		{name: "no default formula/dry run", target: plain, dryRun: true},
+		{name: "no-formula over a default formula", target: withDefault, noFormula: true, wantRouteCmds: 2},
+		{name: "no-formula over a default formula/dry run", target: withDefault, noFormula: true, dryRun: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := newFakeRunner()
+			cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+			deps := testDeps(cfg, runtime.NewFake(), runner.run)
+			convoy, root, task := expandedWorkflowRootConvoyFixture(t, deps.Store)
+			wisp, err := deps.Store.Create(beads.Bead{Title: "attached", Type: "molecule", Status: "open"})
+			if err != nil {
+				t.Fatalf("store.Create(wisp): %v", err)
+			}
+			if err := deps.Store.SetMetadata(root.ID, beadmeta.MoleculeIDMetadataKey, wisp.ID); err != nil {
+				t.Fatalf("SetMetadata(%s molecule_id): %v", root.ID, err)
+			}
+			before, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+			if err != nil {
+				t.Fatalf("list beads: %v", err)
+			}
+
+			opts := testOpts(tt.target, convoy.ID)
+			opts.NoFormula = tt.noFormula
+			opts.Force = tt.force
+			opts.DryRun = tt.dryRun
+			result, err := DoSlingBatch(opts, deps, deps.Store)
+			if err != nil {
+				t.Fatalf("DoSlingBatch: %v, want a plain batch route of both children", err)
+			}
+			if result.Method != "batch" {
+				t.Fatalf("Method = %q, want batch", result.Method)
+			}
+			if result.Total != 2 || result.Routed != 2 || result.Failed != 0 {
+				t.Fatalf("total=%d routed=%d failed=%d, want total=2 routed=2 failed=0", result.Total, result.Routed, result.Failed)
+			}
+			if len(result.AutoBurned) != 0 {
+				t.Fatalf("AutoBurned = %v, want none on a plain batch", result.AutoBurned)
+			}
+			if !tt.dryRun {
+				want := []SlingChildResult{
+					{BeadID: root.ID, Routed: true},
+					{BeadID: task.ID, Routed: true},
+				}
+				if !reflect.DeepEqual(result.Children, want) {
+					t.Fatalf("children = %+v, want %+v", result.Children, want)
+				}
+			}
+			if len(runner.calls) != tt.wantRouteCmds {
+				t.Fatalf("runner calls = %#v, want %d route calls", runner.calls, tt.wantRouteCmds)
+			}
+			after, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+			if err != nil {
+				t.Fatalf("list beads: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("store changed on a plain batch route, which goes through the runner:\n got %+v\nwant %+v", after, before)
+			}
+		})
+	}
+}
+
+// TestDoSlingBatchRoutesRootOnlyAndAttemptRootChildren pins that the two bead
+// shapes next to an expanded workflow root stay slingable as children of a
+// formula-backed batch: a root-only workflow root (the kind without the
+// marker) and a retry or ralph attempt root (the marker with gc.kind=task).
+// Each gets the formula attached and is routed.
+func TestDoSlingBatchRoutesRootOnlyAndAttemptRootChildren(t *testing.T) {
+	shapes := []struct {
+		title    string
+		metadata map[string]string
+	}{
+		{title: "root-only workflow root", metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		}},
+		{title: "marked attempt root", metadata: map[string]string{
+			beadmeta.KindMetadataKey:             beadmeta.KindTask,
+			beadmeta.WorkflowExpandedMetadataKey: "true",
+		}},
+	}
+	for _, route := range formulaBackedBatchRoutes {
+		for _, mode := range formulaBackedBatchModes {
+			t.Run(route.name+"/"+mode.name, func(t *testing.T) {
+				runner := newFakeRunner()
+				cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+				deps := testDeps(cfg, runtime.NewFake(), runner.run)
+				convoy, err := deps.Store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+				if err != nil {
+					t.Fatalf("store.Create(convoy): %v", err)
+				}
+				for _, shape := range shapes {
+					child, err := deps.Store.Create(beads.Bead{Title: shape.title, Type: "task", Status: "open", Metadata: shape.metadata})
+					if err != nil {
+						t.Fatalf("store.Create(%s): %v", shape.title, err)
+					}
+					if err := convoycore.TrackItem(deps.Store, convoy.ID, child.ID); err != nil {
+						t.Fatalf("TrackItem(%s): %v", child.ID, err)
+					}
+				}
+
+				opts := testOpts(route.target, convoy.ID)
+				opts.OnFormula = route.onFormula
+				opts.Force = mode.force
+				result, err := DoSlingBatch(opts, deps, deps.Store)
+				if err != nil {
+					t.Fatalf("DoSlingBatch: %v", err)
+				}
+				if result.Routed != len(shapes) || result.Failed != 0 {
+					t.Fatalf("routed=%d failed=%d, want routed=%d failed=0", result.Routed, result.Failed, len(shapes))
+				}
+				for _, child := range result.Children {
+					if !child.Routed || child.WispRootID == "" {
+						t.Fatalf("child result = %+v, want routed with a wisp attached", child)
+					}
+					got, err := deps.Store.Get(child.BeadID)
+					if err != nil {
+						t.Fatalf("store.Get(%s): %v", child.BeadID, err)
+					}
+					if got.Metadata[beadmeta.MoleculeIDMetadataKey] != child.WispRootID {
+						t.Fatalf("%s molecule_id = %q, want %q", child.BeadID, got.Metadata[beadmeta.MoleculeIDMetadataKey], child.WispRootID)
+					}
+				}
+				if len(runner.calls) != len(shapes) {
+					t.Fatalf("runner calls = %#v, want %d route calls", runner.calls, len(shapes))
 				}
 			})
 		}

@@ -105,7 +105,7 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		// Runs ahead of every mutation below (the reassign reopen, the
 		// attach path's input convoy) so a refusal leaves the store untouched.
 		if usesFormulaBackedRoute(opts) {
-			if err := refuseExpandedWorkflowRootSource(opts.BeadOrFormula, deps); err != nil {
+			if err := refuseExpandedWorkflowRootSource(opts, deps); err != nil {
 				return result, err
 			}
 		}
@@ -367,18 +367,19 @@ func validateExistingBead(beadID string, deps SlingDeps) error {
 // Preflight calls it only for a formula-backed route (--on, or the target's
 // default formula), where the source bead is always validated, with --force
 // and under dry-run too; a plain route of the root is not refused. It reads
-// the bead from the store validateExistingBead found it in.
-func refuseExpandedWorkflowRootSource(beadID string, deps SlingDeps) error {
+// the bead from the store validateExistingBead found it in and decides through
+// RefusesExpandedWorkflowRoot, the rule the convoy batch applies per child.
+func refuseExpandedWorkflowRootSource(opts SlingOpts, deps SlingDeps) error {
 	querier := deps.ValidationQuerier
 	if querier == nil {
 		querier = deps.Store
 	}
-	source, err := querier.Get(beadID)
+	source, err := querier.Get(opts.BeadOrFormula)
 	if err != nil {
-		return &BeadLookupError{BeadID: beadID, StoreRef: deps.StoreRef, Err: err}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: deps.StoreRef, Err: err}
 	}
-	if beadmeta.IsExpandedWorkflow(source.Metadata) {
-		return &ExpandedWorkflowRootError{BeadID: beadID}
+	if RefusesExpandedWorkflowRoot(opts, source) {
+		return &ExpandedWorkflowRootError{BeadID: opts.BeadOrFormula}
 	}
 	return nil
 }
@@ -1939,6 +1940,19 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		return SlingResult{}, fmt.Errorf("%s %s has no open children", b.Type, b.ID)
 	}
 
+	// The per-child path does not run preflight, so the expanded-root refusal
+	// is applied here. Refused children are set aside ahead of the dry-run
+	// preview and the formula pre-checks, so a child the batch refuses is
+	// never counted as routable, read for attachments or mutated.
+	var routable, refused []beads.Bead
+	for _, c := range open {
+		if RefusesExpandedWorkflowRoot(opts, c) {
+			refused = append(refused, c)
+		} else {
+			routable = append(routable, c)
+		}
+	}
+
 	// Cross-rig guard on container.
 	if !opts.Force && !opts.DryRun {
 		if err := CrossRigRouteError(b.ID, a, deps.Cfg); err != nil {
@@ -1955,8 +1969,16 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		batchResult.ContainerType = b.Type
 		batchResult.Method = "batch"
 		batchResult.Total = len(children)
-		batchResult.Routed = len(open)
+		batchResult.Routed = len(routable)
+		batchResult.Failed = len(refused)
 		batchResult.Skipped = len(skipped)
+		if len(refused) > 0 {
+			joined := []error{fmt.Errorf("%d/%d children failed", len(refused), len(open))}
+			for _, c := range refused {
+				joined = append(joined, &ExpandedWorkflowRootError{BeadID: c.ID})
+			}
+			return batchResult, errors.Join(joined...)
+		}
 		return batchResult, nil
 	}
 
@@ -1978,14 +2000,14 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
-		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps); err != nil {
+		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, routable, a, deps); err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
 		checkAttachments := CheckBatchNoMoleculeChildren
 		if isGraph && opts.Force {
 			checkAttachments = CheckBatchNoMoleculeChildrenAllowLiveWorkflow
 		}
-		if err := checkAttachments(querier, open, deps.Store, &batchResult); err != nil {
+		if err := checkAttachments(querier, routable, deps.Store, &batchResult); err != nil {
 			return batchResult, fmt.Errorf("%w", err)
 		}
 	}
@@ -2009,6 +2031,17 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 	var childErrors []error
 	for _, child := range open {
 		childResult := SlingChildResult{BeadID: child.ID}
+
+		if RefusesExpandedWorkflowRoot(opts, child) {
+			err := &ExpandedWorkflowRootError{BeadID: child.ID}
+			childResult.Failed = true
+			childResult.FailReason = err.Error()
+			batchResult.Children = append(batchResult.Children, childResult)
+			childErrors = append(childErrors, err)
+			telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), batchMethod, err)
+			failed++
+			continue
+		}
 
 		if !opts.Force {
 			check := CheckBeadStateWithOptions(querier, child.ID, a, deps, BeadCheckOptions{
