@@ -197,3 +197,24 @@ func TestOnBootStillReopensRootOnlyAndAttemptRoots(t *testing.T) {
 		})
 	}
 }
+
+// TestOnBootReadsABooleanExpandedMarker pins the marker's encoding out of the
+// rule: a store may hold gc.workflow_expanded as the JSON boolean true rather
+// than the string "true", and the hook must read the two alike. A workflow root
+// marked true is not reopened; every shape the string corpus keeps, and a
+// workflow root marked false, still are.
+func TestOnBootReadsABooleanExpandedMarker(t *testing.T) {
+	for _, arm := range onBootArms() {
+		t.Run(arm.name, func(t *testing.T) {
+			got := onBootReopenedIDs(t, expandedRootRoute, arm.reads(booleanMarkerRowsJSON(t, arm.rows)))
+			if slices.Contains(got, "expanded-root") {
+				t.Errorf("on_boot reopened %v; a boolean-true marker on a workflow root is an expanded root and must stay in_progress", got)
+			}
+			for _, want := range append(slices.Clone(arm.stillReopened), "false-marker-root") {
+				if !slices.Contains(got, want) {
+					t.Errorf("on_boot reopened %v, want %s among them", got, want)
+				}
+			}
+		})
+	}
+}

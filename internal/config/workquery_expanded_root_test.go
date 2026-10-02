@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -75,6 +77,35 @@ func expandedRootCorpus(route string) []expandedRootRow {
 			beadmeta.RootBeadIDMetadataKey: "expanded-root",
 		}),
 	}
+}
+
+// booleanMarkerRowsJSON encodes rows the way a store that holds the expanded
+// marker as a JSON boolean returns them: every "true" marker becomes true, and a
+// copy of the root-only root, "false-marker-root", is added carrying false. The
+// Go predicate reads metadata through a string map that renders a boolean as
+// its text, so these rows mean to it exactly what the string corpus does.
+func booleanMarkerRowsJSON(t *testing.T, rows []expandedRootRow) string {
+	t.Helper()
+	rows = slices.Clone(rows)
+	rootOnly := slices.IndexFunc(rows, func(row expandedRootRow) bool { return row.ID == "root-only" })
+	if rootOnly < 0 {
+		t.Fatal("corpus has no root-only row to derive the false-marker root from")
+	}
+	falseMarkerRoot := rows[rootOnly]
+	falseMarkerRoot.ID = "false-marker-root"
+	falseMarkerRoot.Metadata = maps.Clone(falseMarkerRoot.Metadata)
+	falseMarkerRoot.Metadata[beadmeta.WorkflowExpandedMetadataKey] = "false"
+	rows = append(rows, falseMarkerRoot)
+
+	encoded := expandedRootRowsJSON(t, rows...)
+	marker := `"` + beadmeta.WorkflowExpandedMetadataKey + `":`
+	for _, value := range []string{"true", "false"} {
+		if !strings.Contains(encoded, marker+`"`+value+`"`) {
+			t.Fatalf("corpus carries no %s marker to re-encode as a boolean: %s", value, encoded)
+		}
+		encoded = strings.ReplaceAll(encoded, marker+`"`+value+`"`, marker+value)
+	}
+	return encoded
 }
 
 // fakeReadyArm answers the ready reads whose argv matches glob with rows.
@@ -363,6 +394,38 @@ func TestPoolDemandCountSkipsExpandedWorkflowRoot(t *testing.T) {
 	}
 }
 
+// TestPoolDemandQueryReadsABooleanExpandedMarker pins the marker's encoding out
+// of the rule: a store may hold gc.workflow_expanded as the JSON boolean true
+// rather than the string "true", and the query must read the two alike. A
+// workflow root marked true is dropped and not counted; a marked attempt root
+// (gc.kind=task) and a workflow root marked false are still served and counted.
+func TestPoolDemandQueryReadsABooleanExpandedMarker(t *testing.T) {
+	a := &Agent{Name: "worker", Dir: "hello-world"}
+	reader := fakePoolDemandReader("[]", fakeReadyArm{
+		glob: routedReadGlob(expandedRootRoute),
+		rows: booleanMarkerRowsJSON(t, expandedRootCorpus(expandedRootRoute)),
+	})
+	// Executable work first, the two servable workflow roots behind it.
+	wantServed := []string{"attempt-root", "ready-step", "root-only", "false-marker-root"}
+	const wantCount = "4"
+
+	for _, tp := range expandedRootTopologies() {
+		for _, q := range firstRowQueries() {
+			t.Run(q.name+"/"+tp.name, func(t *testing.T) {
+				got := servedIDOrder(t, q.build(a, tp.topo), reader)
+				if !reflect.DeepEqual(got, wantServed) {
+					t.Fatalf("routed tier served %v, want %v (a boolean-true marker on a workflow root is an expanded root)", got, wantServed)
+				}
+			})
+		}
+		t.Run("PoolDemand/"+tp.name, func(t *testing.T) {
+			if got := demandCount(t, a.EffectivePoolDemandQueryFor(tp.topo), reader); got != wantCount {
+				t.Fatalf("pool-demand count = %q, want %q (a boolean-true marker on a workflow root is an expanded root)", got, wantCount)
+			}
+		})
+	}
+}
+
 // unparseableRoutedPayload is a reader payload jq cannot parse: a diagnostic
 // line ahead of the array.
 const unparseableRoutedPayload = `warning: store compacted
@@ -443,7 +506,7 @@ esac
 // expandedRootSelectClause is the jq PoolDemandServeRules renders for
 // ExcludeExpandedWorkflowRoots, spelled out so the pin holds the program rather
 // than the helpers that build it: kind AND marker, never the marker alone.
-const expandedRootSelectClause = ` | select((((.metadata["gc.kind"] // "") == "workflow") and ((.metadata["gc.workflow_expanded"] // "") == "true")) | not)`
+const expandedRootSelectClause = ` | select((((.metadata["gc.kind"] // "") == "workflow") and (((.metadata["gc.workflow_expanded"] // "") | tostring) == "true")) | not)`
 
 // TestPoolDemandServeRulesJQSelectClauses pins the descriptor as the jq rule's
 // source: the clause is rendered from the field, and a descriptor that does not

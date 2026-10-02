@@ -660,9 +660,14 @@ func graphWorkflowAnchorJQPredicate() string {
 // beadmeta.IsExpandedWorkflowRoot: kind is workflow AND the expanded marker is
 // "true". It is the only jq spelling of that rule; every generated script that
 // needs it renders from here.
+//
+// The marker is compared as text (tostring) because a store can hold it as the
+// JSON boolean true as well as the string "true", and the Go predicate reads
+// both as "true". A boolean false, a null and any other value still do not
+// match.
 func expandedWorkflowRootJQPredicate() string {
-	return `(` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `") and (` +
-		jqMeta(beadmeta.WorkflowExpandedMetadataKey) + ` == "true")`
+	return `(` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `") and ((` +
+		jqMeta(beadmeta.WorkflowExpandedMetadataKey) + ` | tostring) == "true")`
 }
 
 // serveOrdinaryInProgressCandidateScript selects the first non-anchor row from
@@ -937,6 +942,11 @@ func poolDemandOriginGateScriptWithGraphAnchorFallback() string {
 		`esac; `
 }
 
+// assignedGraphWorkflowAnchorReadyFunctionScript emits the probe that serves
+// ready routed steps under the session's own assigned workflow anchor. This read
+// carries only the reader-flag serve rules (ShellArgs) and does not apply
+// JQSelectClauses: it reads the steps under one anchor (gc.root_bead_id), not
+// routed roots.
 func assignedGraphWorkflowAnchorReadyFunctionScript(topo QueryTopology) string {
 	fed := topo.FederatedReady
 	readyCommand := readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
