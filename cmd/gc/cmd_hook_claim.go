@@ -3149,8 +3149,22 @@ func workflowRunTargetFallbackEligible(candidate beads.Bead) bool {
 	return !beadmeta.IsExpandedWorkflowRoot(candidate.Metadata)
 }
 
+// hookClaimMatchesRoute reports whether candidate is routed to one of
+// routeTargets as claimable work: by its canonical gc.routed_to, or by the
+// gc.run_target fallback when it carries no canonical route
+// (workflowRunTargetFallbackEligible).
+//
+// An expanded workflow root (beadmeta.IsExpandedWorkflowRoot) never matches,
+// on either key. It is a container whose child steps are the work, so a route
+// stamped on it names where those steps run, not a unit a worker can take.
+// The refusal is route-level and assignee-blind, so the fresh claim
+// (hookCandidateClaimable) and the stale-lease reclaim
+// (hookCandidateReclaimEligible) both inherit it.
 func hookClaimMatchesRoute(candidate beads.Bead, routeTargets []string) bool {
 	if len(routeTargets) == 0 {
+		return false
+	}
+	if beadmeta.IsExpandedWorkflowRoot(candidate.Metadata) {
 		return false
 	}
 	routedTo := strings.TrimSpace(candidate.Metadata[beadmeta.RoutedToMetadataKey])
@@ -3180,9 +3194,18 @@ func hookClaimMatchesRoute(candidate beads.Bead, routeTargets []string) bool {
 // eligibility check, which additionally requires a positive route match
 // even for unrouted work; that stricter rule is correct for claiming but
 // would wrongly hide legitimately unrouted display candidates (ga-1xaqgo.2).
+//
+// An unassigned expanded workflow root (beadmeta.IsExpandedWorkflowRoot) is
+// never visible. The check sits after the assignee branch, so a root this
+// session already holds stays visible as its anchor, and before the unrouted
+// fail-open, because hookClaimRoute reports no route for an expanded root
+// that carries only gc.run_target.
 func hookCandidateVisible(candidate beads.Bead, identities, routeTargets []string) bool {
 	if assignee := strings.TrimSpace(candidate.Assignee); assignee != "" {
 		return hookClaimHasIdentity(assignee, identities)
+	}
+	if beadmeta.IsExpandedWorkflowRoot(candidate.Metadata) {
+		return false
 	}
 	if hookClaimRoute(candidate) == "" {
 		return true
