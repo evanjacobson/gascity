@@ -403,6 +403,8 @@ func renormalizeFederatedCommand(federated string) string {
 	// --sort; the reader's canonical priority order decides) and the
 	// migration fallback (which keeps --sort oldest for its retirement window).
 	federated = strings.ReplaceAll(federated, `--limit=20) || exit $?`, `--limit=20 2>/dev/null)`)
+	routedLimit := `--limit="$` + routedReadyLimitShellVar + `"`
+	federated = strings.ReplaceAll(federated, routedLimit+`) || exit $?`, routedLimit+` 2>/dev/null)`)
 	federated = strings.ReplaceAll(federated, `--limit=20 2>/dev/null) || exit $?`, `--limit=20 2>/dev/null)`)
 	return federated
 }

@@ -392,9 +392,7 @@ func poolDemandFirstRowFunctionScript(topo QueryTopology) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
-		`r=$(` + routedReadyTierCommand(topo) + `)` + readyReaderFailurePropagation(fed) + `; ` +
-		preferExecutablePoolDemandScript() +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+		routedReadyTierScript(topo) +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", topo) + readyReaderStderrSink(fed) + `)` + readyReaderFailurePropagation(fed) + `; ` +
 		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
@@ -417,13 +415,65 @@ func poolDemandFirstRowFunctionScript(topo QueryTopology) string {
 // handling. Dropping them here rather than after the query returns is what lets
 // a read holding nothing servable come back as "[]" and fall through to the
 // tiers behind it instead of ending the probe.
+//
+// Between the two it keeps the first routedReadyWindow of the rows left, so the
+// tier serves at most one window whichever of its reads the rows came from
+// (routedReadyTierScript). The cut comes before the reordering so that both
+// reads serve the same rows: the head of the reader's priority order, reordered
+// within itself. Reordering first would let the whole-route read serve
+// executable rows from anywhere on the route ahead of a higher-priority
+// workflow root, which the bounded read never does.
 func preferExecutablePoolDemandScript() string {
 	predicate := graphWorkflowAnchorJQPredicate()
-	preferJQ := poolDemandServedRowsJQ() + ` | [.[] | select((` + predicate + `) | not)] + [.[] | select(` + predicate + `)]`
+	preferJQ := poolDemandServedRowsJQ() + ` | .[:` + strconv.Itoa(routedReadyWindow) + `]` +
+		` | [.[] | select((` + predicate + `) | not)] + [.[] | select(` + predicate + `)]`
 	return `gc_preferred_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(preferJQ) + ` 2>/dev/null); ` +
 		`[ -n "$gc_preferred_pool_demand" ] && r="$gc_preferred_pool_demand"; `
 }
 
+// routedReadyWindow is how many rows the worker's routed tier reads at a time,
+// and the most it serves.
+const routedReadyWindow = 20
+
+// routedReadyLimitShellVar holds the --limit of the routed read in flight.
+const routedReadyLimitShellVar = "gc_routed_ready_limit"
+
+// routedReadyTierScript emits the routed tier of the worker's probe: read a
+// window of the route, drop and order its rows
+// (preferExecutablePoolDemandScript), and serve what is left.
+//
+// The reader cuts the window before that jq pass drops the rows the serve rules
+// exclude without a reader flag, and those rows can sort ahead of the work: an
+// expanded workflow root is created before its own steps, so it precedes them
+// in the reader's (priority, created_at, id) order. A window that comes back
+// full and holds nothing servable therefore says nothing about the rows behind
+// it, and the tier reads the whole route — the read the reconciler's count form
+// makes (poolDemandCountShell) — so the query prints a row whenever that form
+// counts one on the route. Any other window answers on its own, and the bounded
+// read is the only one issued.
+//
+// That is a property of the query's output, not of what the worker ends up
+// holding. The hook strips the rows it cannot progress from whatever the tier
+// prints (filterUnreadyHookCandidates: blocked, deferred, held), so a served
+// window made up of such rows, from either read, leaves the worker with nothing
+// while routable work sits behind it.
+//
+// Both reads are one statement, run by a loop over the two limits, so the
+// stderr sink, the failure clause and the jq pass of the bounded read are the
+// ones the whole-route read gets.
+func routedReadyTierScript(topo QueryTopology) string {
+	window := strconv.Itoa(routedReadyWindow)
+	return `for ` + routedReadyLimitShellVar + ` in ` + window + ` 0; do ` +
+		`r=$(` + routedReadyTierCommand(topo) + `)` + readyReaderFailurePropagation(topo.FederatedReady) + `; ` +
+		`gc_routed_ready_json="$r"; ` +
+		preferExecutablePoolDemandScript() +
+		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+		`printf "%s" "$gc_routed_ready_json" | jq -e ` + shellquote.Quote(`length >= `+window) + ` >/dev/null 2>&1 || break; ` +
+		`done; `
+}
+
+// routedReadyTierCommand is the routed tier's read, at the limit
+// routedReadyTierScript's loop sets.
 func routedReadyTierCommand(topo QueryTopology) string {
 	// The shared predicate stays order-free so the count-form does no wasted
 	// sorting; the worker first-row path rides the reader's canonical
@@ -436,12 +486,12 @@ func routedReadyTierCommand(topo QueryTopology) string {
 	// live 14-seat city, 2026-08-25: 13 P0 rows parked behind 34 older wave
 	// rows — the bounded window contained zero P0s until the older rows
 	// drained). FIFO fairness survives within a priority band via the
-	// created_at term. The tier stays widened past a single row (limit=20, not
-	// limit=1) so a self-blocked head (is_blocked / status==blocked) has Ready
-	// routed work behind it to fall through to instead of idle-exiting; the
-	// hook layer (filterUnreadyHookCandidates) strips the blocked head from
-	// the result.
-	return bdReadyPoolDemandShell("--limit=20", topo) + readyReaderStderrSink(topo.FederatedReady)
+	// created_at term. The tier stays widened past a single row
+	// (routedReadyWindow, not 1) so a self-blocked head (is_blocked /
+	// status==blocked) has Ready routed work behind it to fall through to
+	// instead of idle-exiting; the hook layer (filterUnreadyHookCandidates)
+	// strips the blocked head from the result.
+	return bdReadyPoolDemandShell(`--limit="$`+routedReadyLimitShellVar+`"`, topo) + readyReaderStderrSink(topo.FederatedReady)
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts

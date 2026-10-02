@@ -162,6 +162,16 @@ the temporary migration predicate reads `gc.run_target=<target>` only on
 work-query form appends `--limit=20` to the canonical probe and serves the
 head of the reader's canonical (priority, created_at, id) default order,
 then filters the migration probe to roots with empty `gc.routed_to`. The
+reader cuts that window before the query's jq drops the rows the serve
+rules exclude without a reader flag (expanded workflow roots, which sort
+ahead of their own steps), so a window that comes back full with nothing
+servable in it is followed by a read of the whole route (`--limit=0`, the
+count form's read), of which the first 20 servable rows are served. Any
+other window is answered by the bounded read alone. This matches the
+query's output to the count form, not what the worker ends up holding: the
+hook still strips rows it cannot progress (blocked, deferred, held) from
+whatever window is served, so a window made up of such rows, from either
+read, leaves the worker with nothing while routable work sits behind it. The
 routed-queue policy is priority-first, FIFO within a priority band: the
 created_at term keeps same-priority work in arrival order, and the
 canonical order is what both readers already default to (`bd ready`'s
@@ -269,7 +279,8 @@ regressions.
     worker and reconciler must also share the temporary migration predicate
     for `gc.run_target=<target>` on `gc.kind=workflow` roots with empty
     `gc.routed_to`; only the worker's first-row form bounds the canonical probe
-    (`--limit=20`) and serves the reader's canonical priority-first order.
+    (`--limit=20`) and serves the reader's canonical priority-first order,
+    reading the whole route only when that window is full of rows it drops.
     Any pool-demand predicate change to one (added filter, modified target
     resolution, new state) MUST be reflected in the other. Diverging the two
     re-introduces the protocol-mismatch class — the reconciler

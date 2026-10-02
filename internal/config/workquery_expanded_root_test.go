@@ -5,6 +5,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -117,11 +118,21 @@ func expandedMarkersAsBooleans(encoded string) string {
 	return encoded
 }
 
-// fakeReadyArm answers the ready reads whose argv matches glob with rows.
+// fakeReadyArm answers the ready reads whose argv matches glob: with rows, cut
+// to the read's --limit, or with a failed read when fails is set.
 type fakeReadyArm struct {
-	glob string
-	rows string
+	glob  string
+	rows  string
+	fails bool
 }
+
+// fakeReaderFailure is what a failing fakeReadyArm prints to stderr and exits
+// with. The status is not 1 so a test can tell the reader's own status from a
+// shell's generic failure.
+const (
+	fakeReaderFailureMessage = "reader: store unreadable"
+	fakeReaderFailureStatus  = 7
+)
 
 // runTargetReadGlob is the sh `case` pattern for the legacy tier's read, the
 // gc.run_target counterpart of routedReadGlob.
@@ -134,13 +145,37 @@ func runTargetReadGlob(route string) string {
 // other read is empty. It serves as `bd` and as `gc` alike — both take `ready`
 // as their first argument — so one fake covers the single-store and federated
 // forms of a query.
+//
+// A ready read honors --limit the way both readers do: a positive limit cuts
+// the arm's rows to that many, and 0 returns them all. Rows that are not a JSON
+// array are printed as given.
 func fakePoolDemandReader(ephemeralOpenRows string, ready ...fakeReadyArm) string {
 	var arms strings.Builder
 	for _, arm := range ready {
-		arms.WriteString("      " + arm.glob + ")\n        printf '%s' '" + arm.rows + "'\n        ;;\n")
+		answer := "emit '" + arm.rows + "'"
+		if arm.fails {
+			answer = "printf '%s\n' '" + fakeReaderFailureMessage + "' >&2\n        exit " + strconv.Itoa(fakeReaderFailureStatus)
+		}
+		arms.WriteString("      " + arm.glob + ")\n        " + answer + "\n        ;;\n")
 	}
 	return `#!/bin/sh
 set -eu
+limit=0
+prev=
+for arg in "$@"; do
+  case "$arg" in
+    --limit=*) limit=${arg#--limit=} ;;
+  esac
+  if [ "$prev" = "--limit" ]; then limit=$arg; fi
+  prev=$arg
+done
+emit() {
+  if [ "$limit" -gt 0 ] && window=$(printf '%s' "$1" | jq -c --argjson limit "$limit" 'if length > $limit then .[:$limit] else empty end' 2>/dev/null) && [ -n "$window" ]; then
+    printf '%s' "$window"
+  else
+    printf '%s' "$1"
+  fi
+}
 case "$1" in
   ready)
     case "$*" in
