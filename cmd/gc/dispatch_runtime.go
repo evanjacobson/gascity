@@ -782,9 +782,11 @@ func workflowServeControlReadyQuery(agentCfg config.Agent, controlSessionNames .
 //
 // It renders from config.PoolDemandServeRules — the same value the worker's
 // generated Tier-3 query and the controller's demand predicate are built from —
-// so this probe cannot come to serve a different set than the one the pool
-// counts and the workers claim. assignee_ready() (Tier 1/2) must stay
-// hold-transparent by design and must never call this.
+// so the flag rules of this probe cannot drift from the ones the pool counts
+// and the workers claim by. It carries the flags only: the rules bd has no
+// flag for (PoolDemandServeRules.JQSelectClauses) are not applied here.
+// assignee_ready() (Tier 1/2) must stay hold-transparent by design and must
+// never call this.
 func controlReadyRoutedDemandArgs() string {
 	return config.PoolDemandServeRulesForQuery().ShellArgs()
 }

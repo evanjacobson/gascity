@@ -103,6 +103,17 @@ func demandRowServable(b beads.Bead) bool {
 			}
 		}
 	}
+	// EXPANDED WORKFLOW ROOT: trimmed, kind AND marker
+	// (beadmeta.IsExpandedWorkflowRoot). The query is not the last word here
+	// either: its jq compares both values exactly, but the hook re-applies the
+	// rule in Go with this same trimming predicate
+	// (isUnassignedExpandedWorkflowRootHookCandidate) before serving a
+	// candidate. A root whose marker reads " true " is served by the reader and
+	// then stripped by the hook. The worker never sees it, so it is not capacity
+	// demand.
+	if rules.ExcludeExpandedWorkflowRoots && beadmeta.IsExpandedWorkflowRoot(b.Metadata) {
+		return false
+	}
 	return true
 }
 

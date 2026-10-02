@@ -182,7 +182,8 @@ func jqMeta(key string) string {
 //
 // The shell builder below renders its flags FROM this value, so the descriptor
 // is not a description of the query — it is the query's source. A flag added
-// there without a field here cannot exist.
+// there without a field here cannot exist. The same holds for the rules bd has
+// no flag for: the query applies them in jq, rendered by JQSelectClauses.
 type PoolDemandServeRules struct {
 	// RequireUnassigned mirrors --unassigned: a row carrying any assignee is
 	// not routed pool demand.
@@ -192,6 +193,11 @@ type PoolDemandServeRules struct {
 	// ExcludeLabels mirrors the repeated --exclude-label flags: the dispatch
 	// holds a worker is deliberately forbidden to claim through.
 	ExcludeLabels []string
+	// ExcludeExpandedWorkflowRoots drops expanded workflow roots
+	// (beadmeta.IsExpandedWorkflowRoot): containers whose child steps are the
+	// work. bd has no flag for it, so the query applies it in jq
+	// (JQSelectClauses).
+	ExcludeExpandedWorkflowRoots bool
 }
 
 // PoolDemandServeRulesForQuery returns the serving rules of the generated
@@ -202,6 +208,8 @@ func PoolDemandServeRulesForQuery() PoolDemandServeRules {
 		RequireUnassigned: true,
 		ExcludeTypes:      []string{"epic"},
 		ExcludeLabels:     append([]string(nil), beadmeta.DispatchHoldLabels...),
+
+		ExcludeExpandedWorkflowRoots: true,
 	}
 }
 
@@ -221,6 +229,26 @@ func (r PoolDemandServeRules) ShellArgs() string {
 		args += ` --exclude-label "` + label + `"`
 	}
 	return args
+}
+
+// JQSelectClauses renders the rules bd has no flag for as jq select(...)
+// clauses over the row in scope (`.`), each led by a pipe so they extend a
+// selector chain. It is the jq counterpart of ShellArgs and the single
+// rendering path for those rules: every generated pool-demand read that applies
+// one renders it from here, so the descriptor and the queries cannot drift.
+func (r PoolDemandServeRules) JQSelectClauses() string {
+	var clauses string
+	if r.ExcludeExpandedWorkflowRoots {
+		clauses += ` | select((` + expandedWorkflowRootJQPredicate() + `) | not)`
+	}
+	return clauses
+}
+
+// poolDemandServedRowsJQ is the array form of JQSelectClauses: a routed ready
+// read's payload in, the rows the tier serves out. The reader's own flags have
+// already applied every other rule, so this is the whole of what jq adds.
+func poolDemandServedRowsJQ() string {
+	return `[.[]` + PoolDemandServeRulesForQuery().JQSelectClauses() + `]`
 }
 
 func bdReadyPoolDemandShell(limitFlag string, topo QueryTopology) string {
@@ -339,7 +367,8 @@ func legacyEphemeralPoolDemandShell(limit int, topo QueryTopology, quiet bool) s
 	}
 	filter := legacyEphemeralReadyFilterJQ(
 		`select((.assignee // "") == "")`+
-			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`") and (`+jqMeta(beadmeta.WorkflowExpandedMetadataKey)+` != "true")))`,
+			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`") and (`+jqMeta(beadmeta.WorkflowExpandedMetadataKey)+` != "true")))`+
+			PoolDemandServeRulesForQuery().JQSelectClauses(),
 		limit,
 		true,
 	)
@@ -382,9 +411,15 @@ func poolDemandFirstRowFunctionScript(topo QueryTopology) string {
 // preference an older root can be returned forever while its ready child waits
 // behind it. A malformed reader payload is preserved for the hook's existing
 // fail-open handling rather than being converted into false-empty demand.
+//
+// The same jq pass first drops the rows the serve rules exclude without a
+// reader flag (poolDemandServedRowsJQ), so both steps share that failure
+// handling. Dropping them here rather than after the query returns is what lets
+// a read holding nothing servable come back as "[]" and fall through to the
+// tiers behind it instead of ending the probe.
 func preferExecutablePoolDemandScript() string {
 	predicate := graphWorkflowAnchorJQPredicate()
-	preferJQ := `[.[] | select((` + predicate + `) | not)] + [.[] | select(` + predicate + `)]`
+	preferJQ := poolDemandServedRowsJQ() + ` | [.[] | select((` + predicate + `) | not)] + [.[] | select(` + predicate + `)]`
 	return `gc_preferred_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(preferJQ) + ` 2>/dev/null); ` +
 		`[ -n "$gc_preferred_pool_demand" ] && r="$gc_preferred_pool_demand"; `
 }
@@ -422,9 +457,15 @@ func routedReadyTierCommand(topo QueryTopology) string {
 // expression (TestEffectiveScaleCheckUsesReadyOnly). That discipline is why this
 // form needed no new failure clause when the federated reader arrived — it is
 // the shape readyReaderFailurePropagation gives the worker-side tiers.
+//
+// The jq serve rules (poolDemandServedRowsJQ) are applied to the routed read as
+// a statement of their own, never piped onto the reader: a pipeline reports only
+// jq's status, which would hide a failed read. A payload jq cannot parse fails
+// that statement, so it is an error too.
 func poolDemandCountShell(target string, topo QueryTopology) string {
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", topo) + `) || exit $?; ` +
+		`ready_json=$(printf "%s" "$ready_json" | ` + shellquote.Join([]string{"jq", poolDemandServedRowsJQ()}) + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", topo) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, topo, false) + `); ` +
@@ -613,6 +654,15 @@ func inProgressBlockedByEnrichmentScriptDeferringGraphAnchor(federated bool, che
 func graphWorkflowAnchorJQPredicate() string {
 	return `(` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `") and (` +
 		jqMeta(beadmeta.FormulaContractMetadataKey) + ` == "graph.v2")`
+}
+
+// expandedWorkflowRootJQPredicate is the jq form of
+// beadmeta.IsExpandedWorkflowRoot: kind is workflow AND the expanded marker is
+// "true". It is the only jq spelling of that rule; every generated script that
+// needs it renders from here.
+func expandedWorkflowRootJQPredicate() string {
+	return `(` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `") and (` +
+		jqMeta(beadmeta.WorkflowExpandedMetadataKey) + ` == "true")`
 }
 
 // serveOrdinaryInProgressCandidateScript selects the first non-anchor row from

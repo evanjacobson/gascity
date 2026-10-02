@@ -1147,8 +1147,9 @@ func workQueryHasReadyWork(output string) bool {
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
-// blocked_by array, the row's own is_blocked / status=="blocked" marker, or a
-// canonical dispatch hold label. The work_query is expected to gate these, but
+// blocked_by array, the row's own is_blocked / status=="blocked" marker, a
+// canonical dispatch hold label, or an unassigned expanded workflow root, which
+// is a container rather than work. The work_query is expected to gate these, but
 // defensive filtering here prevents a single broken query from cascading into
 // agent action on a bead it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
@@ -1184,6 +1185,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isHeldHookCandidate(obj) {
+			continue
+		}
+		if isUnassignedExpandedWorkflowRootHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -1362,6 +1366,26 @@ func isHeldHookCandidate(item map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// isUnassignedExpandedWorkflowRootHookCandidate reports whether item is an
+// expanded workflow root (beadmeta.IsExpandedWorkflowRoot) that no session
+// holds. Such a root is a container whose child steps are the work, so serving
+// it hands a worker a workflow in place of a step.
+//
+// The generated work query drops these rows itself. Filtering here as well
+// covers a pool with a custom work_query, and it is the trimming comparison
+// the controller's demand predicate (demandRowServable) agrees with.
+//
+// The assignee condition keeps an expanded root a session already holds: that
+// root is the session's anchor and must reach the existing-assignment path. A
+// row that does not decode as a bead is not classified and is kept.
+func isUnassignedExpandedWorkflowRootHookCandidate(item map[string]any) bool {
+	candidate, ok := decodeHookCandidateBead(item)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(candidate.Assignee) == "" && beadmeta.IsExpandedWorkflowRoot(candidate.Metadata)
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth
