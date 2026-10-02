@@ -70,14 +70,20 @@ func TestCityStatusWithAgents(t *testing.T) {
 		},
 	}
 
+	// A real directory: observing an agent opens <cityPath>/.gc/events.jsonl,
+	// and a fictional /home path is an autofs lookup on macOS that outlasts
+	// statusObservationTimeout.
+	cityPath := t.TempDir()
+	resetCLIFactoryRecorders(t)
+
 	var stdout, stderr bytes.Buffer
-	code := doCityStatus(sp, dops, cfg, "/home/user/city", &stdout, &stderr)
+	code := doCityStatus(sp, dops, cfg, cityPath, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	out := stdout.String()
 
-	if !strings.Contains(out, "/home/user/city") {
+	if !strings.Contains(out, cityPath) {
 		t.Errorf("stdout missing city path, got:\n%s", out)
 	}
 	if !strings.Contains(out, "Agents:") {
@@ -90,7 +96,7 @@ func TestCityStatusWithAgents(t *testing.T) {
 		t.Errorf("stdout missing 'worker', got:\n%s", out)
 	}
 	if !strings.Contains(out, "1/2 agents running") {
-		t.Errorf("stdout missing '1/2 agents running', got:\n%s", out)
+		t.Errorf("stdout missing '1/2 agents running', got:\n%s\nstderr: %s", out, stderr.String())
 	}
 }
 
@@ -422,8 +428,12 @@ func TestCityStatusJSONWithAgents(t *testing.T) {
 		},
 	}
 
+	// A real directory: see TestCityStatusWithAgents.
+	cityPath := t.TempDir()
+	resetCLIFactoryRecorders(t)
+
 	var stdout, stderr bytes.Buffer
-	code := doCityStatusJSON(sp, cfg, "/home/user/city", &stdout, &stderr)
+	code := doCityStatusJSON(sp, cfg, cityPath, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -438,7 +448,7 @@ func TestCityStatusJSONWithAgents(t *testing.T) {
 		t.Errorf("total_agents = %d, want 4", status.Summary.TotalAgents)
 	}
 	if status.Summary.RunningAgents != 1 {
-		t.Errorf("running_agents = %d, want 1", status.Summary.RunningAgents)
+		t.Errorf("running_agents = %d, want 1; stderr: %s", status.Summary.RunningAgents, stderr.String())
 	}
 	if len(status.Agents) != 4 {
 		t.Fatalf("got %d agents, want 4", len(status.Agents))
