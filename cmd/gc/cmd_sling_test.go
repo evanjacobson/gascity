@@ -7085,6 +7085,62 @@ func TestDryRunConvoyRefusesExpandedWorkflowRootChild(t *testing.T) {
 	}
 }
 
+// TestPreviewSlingDryRunRendersBatchFromResult pins that the convoy dry-run
+// preview is rendered from the result the exit code was decided on, not from a
+// second read of the convoy. With no store to read titles from it still shows
+// the container preview, by bead ID: the failed child as refused with its
+// reason on stderr, the already-routed child as skipped, and only the routable
+// child in the attach and route commands.
+func TestPreviewSlingDryRunRendersBatchFromResult(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	deps, stdout, stderr := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	opts := testOpts(config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}, "CVY-1")
+	opts.OnFormula = "code-review"
+	opts.DryRun = true
+	result := sling.SlingResult{
+		DryRun:        true,
+		BeadID:        "CVY-1",
+		ContainerType: "convoy",
+		Total:         4,
+		Children: []sling.SlingChildResult{
+			{BeadID: "WF-1", Failed: true, FailReason: "refused for a reason"},
+			{BeadID: "BL-1", Skipped: true},
+			{BeadID: "BL-2", Routed: true},
+			{BeadID: "BL-3", Status: "closed", Skipped: true},
+		},
+	}
+
+	if code := previewSlingDryRun(opts, deps, nil, result, stdout, stderr); code != 0 {
+		t.Fatalf("previewSlingDryRun returned %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"Dry run: gc sling mayor CVY-1",
+		"  Type: convoy",
+		"Children (4 total, 3 open)",
+		"    WF-1 (open) → refused",
+		"    BL-1 (open) → already routed (skip)",
+		"    BL-2 (open) → would route + attach wisp",
+		"    BL-3 (closed) → skip",
+		"gc formula cook code-review --attach BL-2",
+		"bd update 'BL-2' --set-metadata gc.routed_to=mayor",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q:\n%s", want, out)
+		}
+	}
+	for _, id := range []string{"WF-1", "BL-1", "BL-3"} {
+		for _, unwanted := range []string{"--attach " + id, "bd update '" + id + "'"} {
+			if strings.Contains(out, unwanted) {
+				t.Errorf("stdout has %q for a child the batch will not route:\n%s", unwanted, out)
+			}
+		}
+	}
+	if want := "  Failed WF-1: refused for a reason\n"; stderr.String() != want {
+		t.Errorf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
 func TestDryRunNudgeRunning(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

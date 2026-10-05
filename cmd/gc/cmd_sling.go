@@ -1071,7 +1071,6 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 // the batch dispatcher: the container preview when the bead expanded as a
 // container, otherwise the single-bead preview.
 func previewSlingDryRun(opts slingOpts, deps slingDeps, querier BeadChildQuerier, result sling.SlingResult, stdout, stderr io.Writer) int {
-	// For batch dry-run, look up the container bead for display.
 	// DoSling sets ContainerType on the result only when it actually
 	// went down the batch path (i.e. the bead is a container type
 	// like convoy). For leaf tasks it returns the single-bead result
@@ -1079,19 +1078,23 @@ func previewSlingDryRun(opts slingOpts, deps slingDeps, querier BeadChildQuerier
 	// dryRunSingle, otherwise it renders the misleading "container
 	// with zero children" output even though the real run would
 	// route the bead itself.
-	if result.ContainerType != "" && querier != nil {
-		if b, getErr := querier.Get(opts.BeadOrFormula); getErr == nil {
-			children, _ := dryRunBatchChildren(querier, b.ID)
-			var open []beads.Bead
-			for _, c := range children {
-				if c.Status == "open" {
-					open = append(open, c)
-				}
-			}
-			return dryRunBatch(opts, deps, stdout, stderr, b, children, open, querier)
+	if result.ContainerType == "" {
+		return dryRunSingle(opts, deps, querier, stdout, stderr)
+	}
+	// The preview is rendered from the result, so it shows the children the
+	// exit code was decided on. The store is read only for display titles;
+	// when that read fails the preview falls back to bare bead IDs.
+	titles := make(map[string]string)
+	if querier != nil {
+		if b, getErr := querier.Get(result.BeadID); getErr == nil {
+			titles[b.ID] = b.Title
+		}
+		children, _ := dryRunBatchChildren(querier, result.BeadID)
+		for _, c := range children {
+			titles[c.ID] = c.Title
 		}
 	}
-	return dryRunSingle(opts, deps, querier, stdout, stderr)
+	return dryRunBatch(opts, deps, stdout, stderr, result, titles)
 }
 
 func dryRunBatchChildren(querier BeadChildQuerier, containerID string) ([]beads.Bead, error) {
@@ -1939,15 +1942,17 @@ func dryRunFormulaAttachIsGraphV2(opts slingOpts, deps slingDeps, a config.Agent
 }
 
 // dryRunBatch prints a step-by-step preview of what gc sling would do for a
-// convoy without executing any side effects.
-func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
-	b beads.Bead, children, open []beads.Bead, querier BeadQuerier,
+// convoy without executing any side effects. It renders the per-child outcomes
+// the dry-run result carries rather than deciding them again; titles maps a
+// bead ID to its display title and may be missing entries.
+func dryRunBatch(opts slingOpts, deps slingDeps, stdout, stderr io.Writer,
+	result sling.SlingResult, titles map[string]string,
 ) int {
 	a := opts.Target
 	w := func(s string) { fmt.Fprintln(stdout, s) } //nolint:errcheck // best-effort
 
 	// Header.
-	w("Dry run: gc sling " + a.QualifiedName() + " " + b.ID)
+	w("Dry run: gc sling " + a.QualifiedName() + " " + result.BeadID)
 	w("")
 
 	// Target section.
@@ -1955,43 +1960,46 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 
 	// Work section — container.
 	w("Work:")
-	label := formatBeadLabel(b.ID, b.Title)
+	label := formatBeadLabel(result.BeadID, titles[result.BeadID])
 	w("  Bead: " + label)
-	w("  Type: " + b.Type)
+	w("  Type: " + result.ContainerType)
 	w("")
-	w("  A " + b.Type + " is a container bead that groups related work. Sling")
+	w("  A " + result.ContainerType + " is a container bead that groups related work. Sling")
 	w("  expands it and routes each open child individually.")
 	w("")
 
 	// Cross-rig section — show when container bead prefix doesn't match agent's rig.
-	printCrossRigSection(w, b.ID, a, deps.Cfg)
+	printCrossRigSection(w, result.BeadID, a, deps.Cfg)
 
-	// Children list. An open child the real run refuses is shown as refused
-	// and left out of the attach and route sections below.
-	w(fmt.Sprintf("  Children (%d total, %d open):", len(children), len(open)))
-	var routable []beads.Bead
-	for _, c := range children {
-		clabel := sling.FormatBeadLabel(c.ID, c.Title)
-		if c.Status == "open" {
-			if sling.RefusesExpandedWorkflowRoot(opts, c) {
-				w("    " + clabel + " (open) → refused (expanded workflow root)")
-				continue
-			}
-			routable = append(routable, c)
-			check := sling.CheckBeadStateWithOptions(querier, c.ID, a, deps, sling.BeadCheckOptions{
-				NoConvoy: opts.NoConvoy,
-			})
-			if check.Idempotent {
-				w("    " + clabel + " (open) → already routed (skip)")
-			} else {
-				suffix := " → would route"
-				if opts.OnFormula != "" || (!opts.NoFormula && a.EffectiveDefaultSlingFormula() != "") {
-					suffix = " → would route + attach wisp"
-				}
-				w("    " + clabel + " (open)" + suffix)
-			}
-		} else {
+	// Children list. A child result carries a status only when the child is
+	// not open. An open child the real run fails is shown as refused, with
+	// its reason on stderr as the real run prints it, and like an
+	// already-routed child it is left out of the attach and route sections.
+	open := 0
+	for _, c := range result.Children {
+		if c.Status == "" {
+			open++
+		}
+	}
+	w(fmt.Sprintf("  Children (%d total, %d open):", result.Total, open))
+	var routable []string
+	for _, c := range result.Children {
+		clabel := sling.FormatBeadLabel(c.BeadID, titles[c.BeadID])
+		switch {
+		case c.Status != "":
 			w("    " + clabel + " (" + c.Status + ") → skip")
+		case c.Failed:
+			w("    " + clabel + " (open) → refused")
+			fmt.Fprintf(stderr, "  Failed %s: %s\n", c.BeadID, c.FailReason) //nolint:errcheck
+		case c.Skipped:
+			w("    " + clabel + " (open) → already routed (skip)")
+		default:
+			routable = append(routable, c.BeadID)
+			suffix := " → would route"
+			if opts.OnFormula != "" || (!opts.NoFormula && a.EffectiveDefaultSlingFormula() != "") {
+				suffix = " → would route + attach wisp"
+			}
+			w("    " + clabel + " (open)" + suffix)
 		}
 	}
 	w("")
@@ -2000,24 +2008,24 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 	if opts.OnFormula != "" {
 		w("Attach formula (per open child):")
 		w("  Would run:")
-		for _, c := range routable {
-			w("    gc formula cook " + opts.OnFormula + " --attach " + c.ID)
+		for _, id := range routable {
+			w("    gc formula cook " + opts.OnFormula + " --attach " + id)
 		}
 		w("")
 	} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
 		w("Default formula (per open child):")
 		w("  Formula: " + a.EffectiveDefaultSlingFormula())
 		w("  Would run:")
-		for _, c := range routable {
-			w("    gc formula cook " + a.EffectiveDefaultSlingFormula() + " --attach " + c.ID)
+		for _, id := range routable {
+			w("    gc formula cook " + a.EffectiveDefaultSlingFormula() + " --attach " + id)
 		}
 		w("")
 	}
 
 	// Route commands.
 	w("Route commands (not executed):")
-	for _, c := range routable {
-		routeCmd, _ := sling.BuildSlingCommandForAgent("sling_query", a.EffectiveSlingQuery(), c.ID, deps.CityPath, deps.CityName, a, deps.Cfg.Rigs)
+	for _, id := range routable {
+		routeCmd, _ := sling.BuildSlingCommandForAgent("sling_query", a.EffectiveSlingQuery(), id, deps.CityPath, deps.CityName, a, deps.Cfg.Rigs)
 		w("  " + routeCmd)
 	}
 	w("")

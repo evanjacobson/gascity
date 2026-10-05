@@ -783,16 +783,6 @@ func (e *ExpandedWorkflowRootError) Error() string {
 		e.BeadID)
 }
 
-// RefusesExpandedWorkflowRoot reports whether a sling with opts refuses source
-// as the bead it would attach a formula to: the route is formula-backed (--on,
-// or the target's default formula) and source is an expanded workflow root.
-// Preflight, the convoy batch and the batch dry-run preview all decide through
-// it, so the refusal holds with --force and under dry-run, and a plain route
-// is never refused.
-func RefusesExpandedWorkflowRoot(opts SlingOpts, source beads.Bead) bool {
-	return usesFormulaBackedRoute(opts) && beadmeta.IsExpandedWorkflow(source.Metadata)
-}
-
 func routeStoreLabel(storeRef string) string {
 	if strings.TrimSpace(storeRef) == "" {
 		return "<unclassified store>"
