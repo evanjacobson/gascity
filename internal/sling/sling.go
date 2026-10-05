@@ -778,7 +778,7 @@ type ExpandedWorkflowRootError struct {
 func (e *ExpandedWorkflowRootError) Error() string {
 	return fmt.Sprintf("gc sling: refusing to attach a formula to an expanded "+
 		"workflow root: bead %s is the root of a workflow whose steps are the "+
-		"work; nothing was routed. Sling one of its steps, or relaunch the "+
+		"work; it was not routed. Sling one of its steps, or relaunch the "+
 		"workflow.",
 		e.BeadID)
 }

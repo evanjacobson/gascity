@@ -6975,6 +6975,172 @@ func TestDryRunBatchOnFormula(t *testing.T) {
 	}
 }
 
+// TestDryRunConvoyRefusesExpandedWorkflowRootChild pins that a convoy dry-run
+// previews what the real run does with an expanded workflow root child. On a
+// formula-backed route, with --force too, the child is shown as refused and
+// left out of the attach and route commands, the command exits 1 with the
+// refusal on stderr, and its sibling still previews as routable. On a plain
+// route the child previews as routable and the command exits 0.
+func TestDryRunConvoyRefusesExpandedWorkflowRootChild(t *testing.T) {
+	const rootCook = "gc formula cook code-review --attach WF-1"
+	const taskCook = "gc formula cook code-review --attach BL-1"
+	const rootRoute = "bd update 'WF-1' --set-metadata gc.routed_to=mayor"
+	const taskRoute = "bd update 'BL-1' --set-metadata gc.routed_to=mayor"
+	plain := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	withDefault := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("code-review")}
+	tests := []struct {
+		name        string
+		target      config.Agent
+		onFormula   string
+		noFormula   bool
+		force       bool
+		wantRefused bool
+	}{
+		{name: "default formula", target: withDefault, wantRefused: true},
+		{name: "default formula with force", target: withDefault, force: true, wantRefused: true},
+		{name: "explicit on", target: plain, onFormula: "code-review", wantRefused: true},
+		{name: "explicit on with force", target: plain, onFormula: "code-review", force: true, wantRefused: true},
+		{name: "plain", target: plain},
+		{name: "no-formula over a default formula", target: withDefault, noFormula: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := newFakeRunner()
+			cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+
+			store := beads.NewMemStoreFrom(0, []beads.Bead{
+				{ID: "CVY-1", Type: "convoy", Status: "open", Title: "Sprint 12 tasks"},
+				{ID: "WF-1", Type: "task", Status: "open", Title: "workflow", Metadata: map[string]string{
+					beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+					beadmeta.WorkflowExpandedMetadataKey: "true",
+				}},
+				{ID: "BL-1", Type: "task", Status: "open", Title: "Login page"},
+			}, []beads.Dep{
+				{IssueID: "CVY-1", DependsOnID: "WF-1", Type: "tracks"},
+				{IssueID: "CVY-1", DependsOnID: "BL-1", Type: "tracks"},
+			})
+
+			deps, stdout, stderr := testDeps(cfg, runtime.NewFake(), runner.run)
+			deps.Store = store
+			opts := testOpts(tt.target, "CVY-1")
+			opts.OnFormula = tt.onFormula
+			opts.NoFormula = tt.noFormula
+			opts.Force = tt.force
+			opts.DryRun = true
+			code := doSlingBatch(opts, deps, store, stdout, stderr)
+
+			wantCode := 0
+			if tt.wantRefused {
+				wantCode = 1
+			}
+			if code != wantCode {
+				t.Fatalf("dry-run returned %d, want %d; stdout: %s\nstderr: %s", code, wantCode, stdout.String(), stderr.String())
+			}
+			out := stdout.String()
+			if !strings.Contains(out, "Children (2 total, 2 open)") {
+				t.Errorf("stdout missing children summary: %s", out)
+			}
+			if !strings.Contains(out, taskRoute) {
+				t.Errorf("stdout missing BL-1 route command: %s", out)
+			}
+			var rootLine string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "WF-1") && strings.Contains(line, "(open)") {
+					rootLine = line
+				}
+			}
+			if tt.wantRefused {
+				if !strings.Contains(rootLine, "refused") || strings.Contains(rootLine, "would route") {
+					t.Errorf("root child line = %q, want it previewed as refused", rootLine)
+				}
+				if !strings.Contains(out, taskCook) {
+					t.Errorf("stdout missing BL-1 cook command: %s", out)
+				}
+				if strings.Contains(out, rootCook) {
+					t.Errorf("stdout attaches a formula to the refused root: %s", out)
+				}
+				if strings.Contains(out, rootRoute) {
+					t.Errorf("stdout routes the refused root: %s", out)
+				}
+				for _, want := range []string{"refusing to attach a formula to an expanded workflow root", "WF-1"} {
+					if !strings.Contains(stderr.String(), want) {
+						t.Errorf("stderr = %q, want %q", stderr.String(), want)
+					}
+				}
+			} else {
+				if !strings.HasSuffix(rootLine, "→ would route") {
+					t.Errorf("root child line = %q, want it previewed as a plain route", rootLine)
+				}
+				if !strings.Contains(out, rootRoute) {
+					t.Errorf("stdout missing WF-1 route command: %s", out)
+				}
+				if strings.Contains(out, "gc formula cook") {
+					t.Errorf("stdout attaches a formula on a plain route: %s", out)
+				}
+			}
+			if len(runner.calls) != 0 {
+				t.Errorf("got %d runner calls, want 0: %v", len(runner.calls), runner.calls)
+			}
+		})
+	}
+}
+
+// TestPreviewSlingDryRunRendersBatchFromResult pins that the convoy dry-run
+// preview is rendered from the result the exit code was decided on, not from a
+// second read of the convoy. With no store to read titles from it still shows
+// the container preview, by bead ID: the failed child as refused with its
+// reason on stderr, the already-routed child as skipped, and only the routable
+// child in the attach and route commands.
+func TestPreviewSlingDryRunRendersBatchFromResult(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	deps, stdout, stderr := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	opts := testOpts(config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}, "CVY-1")
+	opts.OnFormula = "code-review"
+	opts.DryRun = true
+	result := sling.SlingResult{
+		DryRun:        true,
+		BeadID:        "CVY-1",
+		ContainerType: "convoy",
+		Total:         4,
+		Children: []sling.SlingChildResult{
+			{BeadID: "WF-1", Failed: true, FailReason: "refused for a reason"},
+			{BeadID: "BL-1", Skipped: true},
+			{BeadID: "BL-2", Routed: true},
+			{BeadID: "BL-3", Status: "closed", Skipped: true},
+		},
+	}
+
+	if code := previewSlingDryRun(opts, deps, nil, result, stdout, stderr); code != 0 {
+		t.Fatalf("previewSlingDryRun returned %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"Dry run: gc sling mayor CVY-1",
+		"  Type: convoy",
+		"Children (4 total, 3 open)",
+		"    WF-1 (open) → refused",
+		"    BL-1 (open) → already routed (skip)",
+		"    BL-2 (open) → would route + attach wisp",
+		"    BL-3 (closed) → skip",
+		"gc formula cook code-review --attach BL-2",
+		"bd update 'BL-2' --set-metadata gc.routed_to=mayor",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q:\n%s", want, out)
+		}
+	}
+	for _, id := range []string{"WF-1", "BL-1", "BL-3"} {
+		for _, unwanted := range []string{"--attach " + id, "bd update '" + id + "'"} {
+			if strings.Contains(out, unwanted) {
+				t.Errorf("stdout has %q for a child the batch will not route:\n%s", unwanted, out)
+			}
+		}
+	}
+	if want := "  Failed WF-1: refused for a reason\n"; stderr.String() != want {
+		t.Errorf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
 func TestDryRunNudgeRunning(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

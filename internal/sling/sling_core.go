@@ -1939,6 +1939,33 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		return SlingResult{}, fmt.Errorf("%s %s has no open children", b.Type, b.ID)
 	}
 
+	// The per-child path does not run preflight, so the expanded-root refusal
+	// is applied here, on a formula-backed route only. Each open child's
+	// outcome is decided once, ahead of the dry-run preview and the formula
+	// pre-checks, and the loop below acts on that decision: a child the batch
+	// refuses, or skips as already routed, is never counted as routable, read
+	// for attachments or mutated.
+	formulaBacked := usesFormulaBackedRoute(opts)
+	refused := make(map[string]bool)
+	checks := make(map[string]BeadCheckResult)
+	var routable []beads.Bead
+	for _, c := range open {
+		if formulaBacked && beadmeta.IsExpandedWorkflow(c.Metadata) {
+			refused[c.ID] = true
+			continue
+		}
+		if !opts.Force {
+			check := CheckBeadStateWithOptions(querier, c.ID, a, deps, BeadCheckOptions{
+				NoConvoy: opts.NoConvoy,
+			})
+			checks[c.ID] = check
+			if check.Idempotent {
+				continue
+			}
+		}
+		routable = append(routable, c)
+	}
+
 	// Cross-rig guard on container.
 	if !opts.Force && !opts.DryRun {
 		if err := CrossRigRouteError(b.ID, a, deps.Cfg); err != nil {
@@ -1955,9 +1982,30 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		batchResult.ContainerType = b.Type
 		batchResult.Method = "batch"
 		batchResult.Total = len(children)
-		batchResult.Routed = len(open)
-		batchResult.Skipped = len(skipped)
-		return batchResult, nil
+		var childErrors []error
+		for _, child := range children {
+			childResult := SlingChildResult{BeadID: child.ID}
+			switch {
+			case child.Status != "open":
+				childResult.Status = child.Status
+				childResult.Skipped = true
+			case refused[child.ID]:
+				err := &ExpandedWorkflowRootError{BeadID: child.ID}
+				childResult.Failed = true
+				childResult.FailReason = err.Error()
+				childErrors = append(childErrors, err)
+				batchResult.Failed++
+			case checks[child.ID].Idempotent:
+				childResult.Skipped = true
+				batchResult.IdempotentCt++
+			default:
+				childResult.Routed = true
+				batchResult.Routed++
+			}
+			batchResult.Children = append(batchResult.Children, childResult)
+		}
+		batchResult.Skipped = batchResult.IdempotentCt + len(skipped)
+		return batchResult, batchChildrenError(batchResult.Failed, len(open), childErrors)
 	}
 
 	// Pre-check molecule attachments.
@@ -1978,14 +2026,14 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
-		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps); err != nil {
+		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, routable, a, deps); err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
 		checkAttachments := CheckBatchNoMoleculeChildren
 		if isGraph && opts.Force {
 			checkAttachments = CheckBatchNoMoleculeChildrenAllowLiveWorkflow
 		}
-		if err := checkAttachments(querier, open, deps.Store, &batchResult); err != nil {
+		if err := checkAttachments(querier, routable, deps.Store, &batchResult); err != nil {
 			return batchResult, fmt.Errorf("%w", err)
 		}
 	}
@@ -2010,18 +2058,26 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 	for _, child := range open {
 		childResult := SlingChildResult{BeadID: child.ID}
 
-		if !opts.Force {
-			check := CheckBeadStateWithOptions(querier, child.ID, a, deps, BeadCheckOptions{
-				NoConvoy: opts.NoConvoy,
-			})
-			if check.Idempotent {
-				childResult.Skipped = true
-				batchResult.Children = append(batchResult.Children, childResult)
-				idempotent++
-				continue
-			}
-			batchResult.BeadWarnings = append(batchResult.BeadWarnings, check.Warnings...)
+		if refused[child.ID] {
+			err := &ExpandedWorkflowRootError{BeadID: child.ID}
+			childResult.Failed = true
+			childResult.FailReason = err.Error()
+			batchResult.Children = append(batchResult.Children, childResult)
+			childErrors = append(childErrors, err)
+			telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), batchMethod, err)
+			failed++
+			continue
 		}
+
+		// Under --force no child was checked, so the zero value routes it.
+		check := checks[child.ID]
+		if check.Idempotent {
+			childResult.Skipped = true
+			batchResult.Children = append(batchResult.Children, childResult)
+			idempotent++
+			continue
+		}
+		batchResult.BeadWarnings = append(batchResult.BeadWarnings, check.Warnings...)
 
 		if shouldValidateBuiltInRouteStoreReachable(opts, deps) {
 			if err := validateBuiltInRouteStoreReachable(deps, child.ID, a); err != nil {
@@ -2130,16 +2186,23 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		batchResult.NudgeAgent = &a
 	}
 
-	if failed > 0 {
-		summary := fmt.Errorf("%d/%d children failed", failed, len(open))
-		// errors.Join threads typed child errors through Unwrap() []error so
-		// errors.As at the CLI/API boundary can recover *ConflictError and map
-		// it to exit 3 + the cleanup hint; the summary stays first for the
-		// human-readable message.
-		joined := append([]error{summary}, childErrors...)
-		return batchResult, errors.Join(joined...)
+	return batchResult, batchChildrenError(failed, len(open), childErrors)
+}
+
+// batchChildrenError returns the error for a batch in which failed of its open
+// children failed, or nil when none did. Both the real run and the dry-run
+// return through it, so the two cannot report a failed child differently.
+func batchChildrenError(failed, open int, childErrors []error) error {
+	if failed == 0 {
+		return nil
 	}
-	return batchResult, nil
+	summary := fmt.Errorf("%d/%d children failed", failed, open)
+	// errors.Join threads typed child errors through Unwrap() []error so
+	// errors.As at the CLI/API boundary can recover *ConflictError and map
+	// it to exit 3 + the cleanup hint; the summary stays first for the
+	// human-readable message.
+	joined := append([]error{summary}, childErrors...)
+	return errors.Join(joined...)
 }
 
 func selectedStoreContainer(opts SlingOpts, deps SlingDeps) (beads.Bead, bool) {
