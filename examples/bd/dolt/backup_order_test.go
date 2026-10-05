@@ -550,15 +550,20 @@ exit %d
 	return logPath
 }
 
+// writeRecordingTimeout installs the recorder under both names run_bounded
+// resolves: _bounded.sh prefers gtimeout, so a fake named only timeout is
+// bypassed on a macOS host whose Homebrew coreutils exposes a real gtimeout.
 func writeRecordingTimeout(t *testing.T, binDir string) string {
 	t.Helper()
 	logPath := filepath.Join(binDir, "timeout.log")
-	writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
+	for _, name := range []string{"gtimeout", "timeout"} {
+		writeExecutable(t, filepath.Join(binDir, name), fmt.Sprintf(`#!/bin/sh
 printf 'timeout %%s\n' "$*" >> %s
 [ "$1" = "--kill-after=2" ] && shift
 shift
 exec "$@"
 `, shellQuote(logPath)))
+	}
 	return logPath
 }
 
