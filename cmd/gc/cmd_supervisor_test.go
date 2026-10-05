@@ -5166,9 +5166,11 @@ func (hangingListProvider) ListRunning(string) ([]string, error) {
 
 func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 	cityPath := t.TempDir()
-	logFile := filepath.Join(t.TempDir(), "ops.log")
-	script := writeSpyScript(t, logFile)
-	t.Setenv("GC_BEADS", "exec:"+script)
+	// The file provider has no stop op to exec, so the elapsed time below
+	// is the grace and forced waits alone. An exec provider's stop script
+	// runs after those waits under its own timeout, and spawning it costs
+	// ~90ms on macOS — enough to cross the bound with no double wait.
+	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
 
 	closer := &closerSpy{}
