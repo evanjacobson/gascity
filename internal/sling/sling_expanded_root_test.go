@@ -3,6 +3,7 @@ package sling
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -176,6 +177,21 @@ func TestDoSlingRefusesFormulaBackedRouteOfExpandedWorkflowRoot(t *testing.T) {
 				if refused.BeadID != root.ID {
 					t.Fatalf("ExpandedWorkflowRootError.BeadID = %q, want %q", refused.BeadID, root.ID)
 				}
+				if refused.Formula != "code-review" {
+					t.Fatalf("ExpandedWorkflowRootError.Formula = %q, want code-review", refused.Formula)
+				}
+				if wantDefault := route.onFormula == ""; refused.DefaultFormula != wantDefault {
+					t.Fatalf("ExpandedWorkflowRootError.DefaultFormula = %v, want %v", refused.DefaultFormula, wantDefault)
+				}
+				wantSource := "--on code-review"
+				if refused.DefaultFormula {
+					wantSource = `target "mayor"'s default_sling_formula`
+				}
+				for _, want := range []string{wantSource, "gc sling mayor " + root.ID + " --no-formula"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error = %q, want it to contain %q", err, want)
+					}
+				}
 
 				requireOnlySeedBeads(t, deps.Store, 2)
 				after, err := deps.Store.Get(root.ID)
@@ -199,5 +215,115 @@ func TestDoSlingRefusesFormulaBackedRouteOfExpandedWorkflowRoot(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestDoSlingClaimedExpandedWorkflowRootReslingStaysIdempotent pins that the
+// refusal covers only a sling that would attach. An expanded workflow root
+// already routed to and claimed by the target re-slings as the idempotent
+// no-op it always was, on both formula-backed routes: nothing would be
+// attached, so there is nothing to refuse.
+func TestDoSlingClaimedExpandedWorkflowRootReslingStaysIdempotent(t *testing.T) {
+	routes := []struct {
+		name      string
+		target    config.Agent
+		onFormula string
+	}{
+		{
+			name:   "default formula",
+			target: config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("code-review")},
+		},
+		{
+			name:      "explicit on",
+			target:    config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)},
+			onFormula: "code-review",
+		},
+	}
+	for _, route := range routes {
+		t.Run(route.name, func(t *testing.T) {
+			runner := newFakeRunner()
+			cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+			deps := testDeps(cfg, runtime.NewFake(), runner.run)
+			convoy, err := deps.Store.Create(beads.Bead{Title: "convoy", Type: "convoy", Status: "open"})
+			if err != nil {
+				t.Fatalf("store.Create(convoy): %v", err)
+			}
+			root, err := deps.Store.Create(beads.Bead{
+				Title:    "workflow",
+				Type:     "task",
+				Status:   "open",
+				ParentID: convoy.ID,
+				Assignee: "mayor",
+				Metadata: map[string]string{
+					beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+					beadmeta.FormulaContractMetadataKey:  beadmeta.FormulaContractGraphV2,
+					beadmeta.WorkflowExpandedMetadataKey: "true",
+					beadmeta.RoutedToMetadataKey:         "mayor",
+				},
+			})
+			if err != nil {
+				t.Fatalf("store.Create(root): %v", err)
+			}
+
+			opts := testOpts(route.target, root.ID)
+			opts.OnFormula = route.onFormula
+			result, err := DoSling(opts, deps, deps.Store)
+			if err != nil {
+				t.Fatalf("DoSling: %v, want the already-routed no-op", err)
+			}
+			if !result.Idempotent {
+				t.Fatalf("Idempotent = false, want the already-routed no-op; result = %+v", result)
+			}
+			requireOnlySeedBeads(t, deps.Store, 2)
+			if len(runner.calls) != 0 {
+				t.Fatalf("runner calls = %#v, want none", runner.calls)
+			}
+		})
+	}
+}
+
+// countingBeadQuerier counts the reads a sling makes through it.
+type countingBeadQuerier struct {
+	BeadQuerier
+	gets int
+}
+
+func (q *countingBeadQuerier) Get(id string) (beads.Bead, error) {
+	q.gets++
+	return q.BeadQuerier.Get(id)
+}
+
+// TestDoSlingRefusesExpandedWorkflowRootFromValidatedSourceRead pins that the
+// refusal decides from the bead the source validation already read. A second
+// read would cost every formula-backed sling a lookup and open a window in
+// which a vanished bead surfaces as a lookup failure instead of a missing bead.
+func TestDoSlingRefusesExpandedWorkflowRootFromValidatedSourceRead(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("code-review")}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	root, err := deps.Store.Create(beads.Bead{
+		Title:  "workflow",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:             beadmeta.KindWorkflow,
+			beadmeta.WorkflowExpandedMetadataKey: "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create(root): %v", err)
+	}
+	validation := &countingBeadQuerier{BeadQuerier: deps.Store}
+	deps.ValidationQuerier = validation
+
+	opts := testOpts(a, root.ID)
+	opts.Force = true
+	_, err = DoSling(opts, deps, deps.Store)
+	var refused *ExpandedWorkflowRootError
+	if !errors.As(err, &refused) {
+		t.Fatalf("DoSling error = %T %[1]v, want ExpandedWorkflowRootError", err)
+	}
+	if validation.gets != 1 {
+		t.Fatalf("source validation reads = %d, want 1", validation.gets)
 	}
 }

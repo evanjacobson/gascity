@@ -772,15 +772,26 @@ func (e *CrossStoreRouteError) Error() string {
 // wrap a second workflow around the first.
 type ExpandedWorkflowRootError struct {
 	BeadID string
+	Target string
+	// Formula is the formula the sling would have attached.
+	Formula string
+	// DefaultFormula reports that Formula came from the target's
+	// default_sling_formula rather than an explicit --on.
+	DefaultFormula bool
 }
 
 // Error returns the expanded-workflow-root routing diagnostic.
 func (e *ExpandedWorkflowRootError) Error() string {
-	return fmt.Sprintf("gc sling: refusing to attach a formula to an expanded "+
-		"workflow root: bead %s is the root of a workflow whose steps are the "+
-		"work; nothing was routed. Sling one of its steps, or relaunch the "+
-		"workflow.",
-		e.BeadID)
+	source := "--on " + e.Formula
+	if e.DefaultFormula {
+		source = fmt.Sprintf("target %q's default_sling_formula", e.Target)
+	}
+	return fmt.Sprintf("gc sling: refusing to attach formula %q (%s) to an "+
+		"expanded workflow root: bead %s is the root of a workflow whose steps "+
+		"are the work; nothing was routed. Sling one of its steps, relaunch "+
+		"the workflow, or route the root without a formula: "+
+		"gc sling %s %s --no-formula",
+		e.Formula, source, e.BeadID, e.Target, e.BeadID)
 }
 
 func routeStoreLabel(storeRef string) string {
@@ -797,17 +808,24 @@ func ProbeBeadInStore(store beads.Store, id string) (bool, error) {
 }
 
 func probeBeadInQuerier(querier BeadQuerier, id string) (bool, error) {
+	_, exists, err := readBeadInQuerier(querier, id)
+	return exists, err
+}
+
+// readBeadInQuerier is probeBeadInQuerier for a caller that also needs the
+// bead the probe read.
+func readBeadInQuerier(querier BeadQuerier, id string) (beads.Bead, bool, error) {
 	if querier == nil {
-		return false, fmt.Errorf("store unavailable")
+		return beads.Bead{}, false, fmt.Errorf("store unavailable")
 	}
-	_, err := querier.Get(id)
+	b, err := querier.Get(id)
 	if err == nil {
-		return true, nil
+		return b, true, nil
 	}
 	if errors.Is(err, beads.ErrNotFound) {
-		return false, nil
+		return beads.Bead{}, false, nil
 	}
-	return false, err
+	return beads.Bead{}, false, err
 }
 
 // LooksLikeBeadID reports whether a string loosely resembles a bead ID.

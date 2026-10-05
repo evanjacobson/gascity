@@ -98,16 +98,12 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		result.PoolEmpty = true
 	}
 
+	var source beads.Bead
 	if shouldValidateExistingBead(opts) {
-		if err := validateExistingBead(opts.BeadOrFormula, deps); err != nil {
+		var err error
+		source, err = validateExistingBead(opts.BeadOrFormula, deps)
+		if err != nil {
 			return result, err
-		}
-		// Runs ahead of every mutation below (the reassign reopen, the
-		// attach path's input convoy) so a refusal leaves the store untouched.
-		if usesFormulaBackedRoute(opts) {
-			if err := refuseExpandedWorkflowRootSource(opts.BeadOrFormula, deps); err != nil {
-				return result, err
-			}
 		}
 	}
 	if shouldGuardCrossRig(opts) {
@@ -128,6 +124,12 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		if resolveIdempotentShortCircuit(opts, a, deps, querier, &result) {
 			return result, nil
 		}
+	}
+	// Past the idempotent short-circuit, a formula-backed route attaches. Runs
+	// ahead of every mutation below (the reassign reopen, the attach path's
+	// input convoy) so a refusal leaves the store untouched.
+	if err := refuseExpandedWorkflowRootSource(opts, source); err != nil {
+		return result, err
 	}
 	if shouldValidateBuiltInRouteStoreReachable(opts, deps) {
 		if err := validateBuiltInRouteStoreReachable(deps, opts.BeadOrFormula, a); err != nil {
@@ -353,52 +355,60 @@ func shouldReopenForReassign(opts SlingOpts) bool {
 	return opts.Reassign && !opts.IsFormula && !opts.DryRun
 }
 
-func validateExistingBead(beadID string, deps SlingDeps) error {
+func validateExistingBead(beadID string, deps SlingDeps) (beads.Bead, error) {
 	querier := deps.ValidationQuerier
 	if querier == nil {
 		querier = deps.Store
 	}
-	return validateExistingBeadInQuerier(beadID, deps.StoreRef, querier)
+	return readExistingBeadInQuerier(beadID, deps.StoreRef, querier)
 }
 
 // refuseExpandedWorkflowRootSource returns an *ExpandedWorkflowRootError when
-// the source bead of a formula-backed route is an expanded workflow root.
-// Attaching a formula to such a root wraps a second workflow around the first.
-// Preflight calls it only for a formula-backed route (--on, or the target's
-// default formula), where the source bead is always validated, with --force
-// and under dry-run too; a plain route of the root is not refused. It reads
-// the bead from the store validateExistingBead found it in.
-func refuseExpandedWorkflowRootSource(beadID string, deps SlingDeps) error {
-	querier := deps.ValidationQuerier
-	if querier == nil {
-		querier = deps.Store
+// a formula-backed route (--on, or the target's default formula) would attach
+// to a source bead that is an expanded workflow root: that wraps a second
+// workflow around the first. source is the bead validateExistingBead read,
+// which a formula-backed route always validates, with --force and under
+// dry-run too. A plain route of the root is not refused, nor is a re-sling
+// the idempotent short-circuit already resolved as a no-op.
+func refuseExpandedWorkflowRootSource(opts SlingOpts, source beads.Bead) error {
+	if !usesFormulaBackedRoute(opts) || !beadmeta.IsExpandedWorkflow(source.Metadata) {
+		return nil
 	}
-	source, err := querier.Get(beadID)
-	if err != nil {
-		return &BeadLookupError{BeadID: beadID, StoreRef: deps.StoreRef, Err: err}
+	refused := &ExpandedWorkflowRootError{
+		BeadID:  opts.BeadOrFormula,
+		Target:  opts.Target.QualifiedName(),
+		Formula: opts.OnFormula,
 	}
-	if beadmeta.IsExpandedWorkflow(source.Metadata) {
-		return &ExpandedWorkflowRootError{BeadID: beadID}
+	if refused.Formula == "" {
+		refused.Formula = opts.Target.EffectiveDefaultSlingFormula()
+		refused.DefaultFormula = true
 	}
-	return nil
+	return refused
 }
 
 func validateExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier) error {
+	_, err := readExistingBeadInQuerier(beadID, storeRef, querier)
+	return err
+}
+
+// readExistingBeadInQuerier is validateExistingBeadInQuerier for a caller that
+// also needs the bead the validation read.
+func readExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier) (beads.Bead, error) {
 	storeRef = strings.TrimSpace(storeRef)
 	if storeRef == "" {
 		storeRef = "local"
 	}
 	if querier == nil {
-		return &BeadLookupError{BeadID: beadID, StoreRef: storeRef, Err: errors.New("store not configured")}
+		return beads.Bead{}, &BeadLookupError{BeadID: beadID, StoreRef: storeRef, Err: errors.New("store not configured")}
 	}
-	exists, err := probeBeadInQuerier(querier, beadID)
+	source, exists, err := readBeadInQuerier(querier, beadID)
 	if err != nil {
-		return &BeadLookupError{BeadID: beadID, StoreRef: storeRef, Err: err}
+		return beads.Bead{}, &BeadLookupError{BeadID: beadID, StoreRef: storeRef, Err: err}
 	}
 	if exists {
-		return nil
+		return source, nil
 	}
-	return &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
+	return beads.Bead{}, &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
 }
 
 // slingFormula handles the --formula dispatch path.
